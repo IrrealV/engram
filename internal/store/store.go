@@ -1683,6 +1683,7 @@ func (s *Store) projectSyncBackfillRequired(project string) (bool, error) {
 			SELECT 1
 			FROM sessions sess
 			WHERE sess.project = ?
+			  AND trim(ifnull(sess.directory, '')) <> ''
 			  AND NOT EXISTS (
 				SELECT 1 FROM sync_mutations sm
 				WHERE sm.target_key = ?
@@ -4428,6 +4429,7 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 		{
 			q: `SELECT COUNT(*) FROM sessions
 			    WHERE project = ?
+			      AND trim(ifnull(directory, '')) <> ''
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
 			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = sessions.id AND sm.source = ?
@@ -4549,7 +4551,7 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error
 
 	// Phase 2: insert now that the read cursor is closed.
 	for _, payload := range pending {
-		if err := s.enqueueSyncMutationTx(tx, SyncEntitySession, payload.ID, SyncOpUpsert, payload); err != nil {
+		if err := s.enqueueSessionUpsertFromPersistedStateTx(tx, payload); err != nil {
 			return err
 		}
 	}
@@ -4616,6 +4618,9 @@ func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) e
 
 	// Phase 2: insert live observation mutations.
 	for _, payload := range pending {
+		if err := validateGeneratedSyncMutationPayload(SyncEntityObservation, payload.SyncID, SyncOpUpsert, payload); err != nil {
+			return err
+		}
 		if err := s.enqueueSyncMutationTx(tx, SyncEntityObservation, payload.SyncID, SyncOpUpsert, payload); err != nil {
 			return err
 		}
@@ -4667,6 +4672,9 @@ func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) e
 
 	// Phase 2: insert deleted observation mutations.
 	for _, payload := range deletedPending {
+		if err := validateGeneratedSyncMutationPayload(SyncEntityObservation, payload.SyncID, SyncOpDelete, payload); err != nil {
+			return err
+		}
 		if err := s.enqueueSyncMutationTx(tx, SyncEntityObservation, payload.SyncID, SyncOpDelete, payload); err != nil {
 			return err
 		}
@@ -4805,6 +4813,18 @@ func shouldSkipPartialLocalSessionUpsert(validation SyncMutationPayloadValidatio
 		}
 	}
 	return true
+}
+
+func validateGeneratedSyncMutationPayload(entity, entityKey, op string, payload any) error {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	validation := ValidateSyncMutationPayload(entity, op, string(encoded), entityKey)
+	if validation.ReasonCode == "" {
+		return nil
+	}
+	return fmt.Errorf("backfill generated invalid %s %s mutation for %q: %s", entity, op, entityKey, validation.Message)
 }
 
 func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, payload any) error {

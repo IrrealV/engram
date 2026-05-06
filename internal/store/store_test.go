@@ -4821,6 +4821,61 @@ func TestObservationOutboxSkipsLocalProjectlessAndRejectsCloudBoundInvalid(t *te
 	})
 }
 
+func TestBackfillValidatesGeneratedSyncPayloads(t *testing.T) {
+	t.Run("session missing directory stays local only", func(t *testing.T) {
+		s := newTestStore(t)
+		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`, "bad-session", "bad-backfill", ""); err != nil {
+			t.Fatalf("insert invalid session: %v", err)
+		}
+
+		if err := s.EnrollProject("bad-backfill"); err != nil {
+			t.Fatalf("expected partial session backfill to skip invalid mutation safely: %v", err)
+		}
+		assertNoBackfillMutation(t, s, "bad-session")
+	})
+
+	t.Run("partial session does not repeat as repairable backfill gap", func(t *testing.T) {
+		s := newTestStore(t)
+		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`, "partial-noop-session", "partial-noop", ""); err != nil {
+			t.Fatalf("insert partial session: %v", err)
+		}
+		if err := s.EnrollProject("partial-noop"); err != nil {
+			t.Fatalf("enroll partial project: %v", err)
+		}
+
+		report, err := s.RepairCloudUpgrade("partial-noop", false)
+		if err != nil {
+			t.Fatalf("repair dry run for partial session: %v", err)
+		}
+		if report.Class != UpgradeRepairClassReady || report.ReasonCode != "upgrade_repair_noop" {
+			t.Fatalf("expected partial skipped session not to report repairable backfill gap, got %+v", report)
+		}
+		assertNoBackfillMutation(t, s, "partial-noop-session")
+	})
+
+	t.Run("observation missing required field fails loudly", func(t *testing.T) {
+		s := newTestStore(t)
+		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`, "bad-observation-session", "bad-backfill", "/tmp/bad-backfill"); err != nil {
+			t.Fatalf("insert session: %v", err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope) VALUES (?, ?, ?, ?, ?, ?, ?)`, "bad-observation", "bad-observation-session", "note", "", "content", "bad-backfill", "project"); err != nil {
+			t.Fatalf("insert invalid observation: %v", err)
+		}
+
+		err := s.EnrollProject("bad-backfill")
+		if err == nil || !strings.Contains(err.Error(), "observation payload missing required fields: title") {
+			t.Fatalf("expected loud observation payload validation failure, got %v", err)
+		}
+		assertNoBackfillMutation(t, s, "bad-observation-session")
+		assertNoBackfillMutation(t, s, "bad-observation")
+	})
+}
+
+func assertNoBackfillMutation(t *testing.T, s *Store, entityKey string) {
+	t.Helper()
+	assertNoSyncMutationForKey(t, s, entityKey)
+}
+
 func TestTruncateUTF8(t *testing.T) {
 	tests := []struct {
 		name string
