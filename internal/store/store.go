@@ -49,6 +49,7 @@ var (
 	ErrSessionDeleteBlocked   = errors.New("session deletion is blocked while cloud sync enrollment is active")
 	ErrObservationNotFound    = errors.New("observation not found")
 	ErrPromptNotFound         = errors.New("prompt not found")
+	ErrProjectlessSyncBlocked = errors.New("projectless session/observation sync mutation blocks cloud push")
 )
 
 // Sentinel errors for relation sync apply path (Phase 2).
@@ -3181,8 +3182,11 @@ func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMut
 	if limit <= 0 {
 		limit = 100
 	}
+	if err := s.failIfPendingProjectlessEntitySyncMutations(targetKey); err != nil {
+		return nil, err
+	}
 	// Only return mutations for enrolled projects or empty-project (global) mutations.
-	// Empty-project mutations always sync regardless of enrollment.
+	// Legacy projectless session/observation rows fail loudly before this query.
 	rows, err := s.queryItHook(s.db, `
 		SELECT sm.seq, sm.target_key, sm.entity, sm.entity_key, sm.op, sm.payload, sm.source, sm.project, sm.occurred_at, sm.acked_at
 		FROM sync_mutations sm
@@ -3212,6 +3216,9 @@ func (s *Store) ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int6
 	if limit <= 0 {
 		limit = 100
 	}
+	if err := s.failIfPendingProjectlessEntitySyncMutations(targetKey); err != nil {
+		return nil, err
+	}
 	rows, err := s.queryItHook(s.db, `
 		SELECT sm.seq, sm.target_key, sm.entity, sm.entity_key, sm.op, sm.payload, sm.source, sm.project, sm.occurred_at, sm.acked_at
 		FROM sync_mutations sm
@@ -3235,6 +3242,27 @@ func (s *Store) ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int6
 		mutations = append(mutations, mutation)
 	}
 	return mutations, rows.Err()
+}
+
+func (s *Store) failIfPendingProjectlessEntitySyncMutations(targetKey string) error {
+	var seq int64
+	var entity string
+	err := s.db.QueryRow(`
+		SELECT seq, entity
+		FROM sync_mutations
+		WHERE target_key = ?
+		  AND acked_at IS NULL
+		  AND project = ''
+		  AND entity IN (?, ?)
+		ORDER BY seq ASC
+		LIMIT 1`, targetKey, SyncEntitySession, SyncEntityObservation).Scan(&seq, &entity)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: target_key=%q seq=%d entity=%s", ErrProjectlessSyncBlocked, targetKey, seq, entity)
 }
 
 func (s *Store) CountPendingNonEnrolledSyncMutations(targetKey string) ([]PendingSyncMutationProjectCount, error) {

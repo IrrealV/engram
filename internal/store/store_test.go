@@ -6163,6 +6163,50 @@ func TestEmptyProjectSessionDoesNotEnqueueInvalidSyncMutation(t *testing.T) {
 	}
 }
 
+func TestListPendingSyncMutationsFailsOnProjectlessSessionObservationLegacyBlockers(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	if err := s.CreateSession("enrolled-syncable", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create enrolled session: %v", err)
+	}
+
+	fixtures := []legacyMutationFixture{
+		{entity: SyncEntitySession, entityKey: "legacy-projectless-session", payload: `{"id":"legacy-projectless-session","project":"engram","directory":"/tmp/engram"}`},
+		{entity: SyncEntityObservation, entityKey: "legacy-projectless-observation", payload: `{"sync_id":"legacy-projectless-observation","session_id":"legacy-projectless-session","type":"decision","title":"Legacy","content":"Legacy content","scope":"project"}`},
+	}
+	for _, fixture := range fixtures {
+		insertLegacyMutation(t, s, fixture)
+	}
+
+	if _, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 100); !errors.Is(err, ErrProjectlessSyncBlocked) {
+		t.Fatalf("expected projectless blocker error from ListPendingSyncMutations, got %v", err)
+	}
+	if _, err := s.ListPendingSyncMutationsAfterSeq(DefaultSyncTargetKey, 1, 100); !errors.Is(err, ErrProjectlessSyncBlocked) {
+		t.Fatalf("expected projectless blocker error from ListPendingSyncMutationsAfterSeq, got %v", err)
+	}
+}
+
+func TestListPendingSyncMutationsDoesNotBlockProjectlessPromptRelationRows(t *testing.T) {
+	s := newTestStore(t)
+	insertLegacyMutation(t, s, legacyMutationFixture{entity: SyncEntityPrompt, entityKey: "legacy-projectless-prompt", payload: `{}`})
+	insertLegacyMutation(t, s, legacyMutationFixture{entity: SyncEntityRelation, entityKey: "legacy-projectless-relation", payload: `{}`})
+
+	mutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatalf("projectless prompt/relation mutations should not block listing: %v", err)
+	}
+	if len(mutations) != 2 {
+		t.Fatalf("expected prompt and relation mutations to keep existing empty-project behavior, got %+v", mutations)
+	}
+	for _, mutation := range mutations {
+		if mutation.Entity == SyncEntitySession || mutation.Entity == SyncEntityObservation {
+			t.Fatalf("unexpected session/observation mutation in prompt/relation test: %+v", mutation)
+		}
+	}
+}
+
 func TestSkipAckDoesNotAffectEmptyProjectMutations(t *testing.T) {
 	s := newTestStore(t)
 
