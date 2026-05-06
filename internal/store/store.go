@@ -2002,8 +2002,9 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	p.Project, _ = NormalizeProject(p.Project)
 
 	// Strip <private>...</private> tags before persisting ANYTHING
-	title := stripPrivateTags(p.Title)
-	content := stripPrivateTags(p.Content)
+	p.Type = strings.TrimSpace(p.Type)
+	title := strings.TrimSpace(stripPrivateTags(p.Title))
+	content := strings.TrimSpace(stripPrivateTags(p.Content))
 
 	if len(content) > s.cfg.MaxObservationLength {
 		content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
@@ -2451,13 +2452,13 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 		topicKey := derefString(obs.TopicKey)
 
 		if p.Type != nil {
-			typ = *p.Type
+			typ = strings.TrimSpace(*p.Type)
 		}
 		if p.Title != nil {
-			title = stripPrivateTags(*p.Title)
+			title = strings.TrimSpace(stripPrivateTags(*p.Title))
 		}
 		if p.Content != nil {
-			content = stripPrivateTags(*p.Content)
+			content = strings.TrimSpace(stripPrivateTags(*p.Content))
 			if len(content) > s.cfg.MaxObservationLength {
 				content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
 			}
@@ -2470,6 +2471,19 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 		}
 		if p.TopicKey != nil {
 			topicKey = normalizeTopicKey(*p.TopicKey)
+		}
+		cloudBound := strings.TrimSpace(project) != ""
+		if cloudBound && strings.TrimSpace(typ) == "" {
+			return fmt.Errorf("observation type is required for cloud sync outbox entries")
+		}
+		if cloudBound && strings.TrimSpace(title) == "" {
+			return fmt.Errorf("observation title is required for cloud sync outbox entries")
+		}
+		if cloudBound && strings.TrimSpace(content) == "" {
+			return fmt.Errorf("observation content is required for cloud sync outbox entries")
+		}
+		if cloudBound && strings.TrimSpace(scope) == "" {
+			return fmt.Errorf("observation scope is required for cloud sync outbox entries")
 		}
 
 		if _, err := s.execHook(tx,
@@ -4810,7 +4824,10 @@ func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, 
 			}
 		}
 	}
-	if shouldValidateNewSessionOutboxPayload(entity) {
+	if shouldSkipProjectlessObservationMutation(entity, project) {
+		return nil
+	}
+	if shouldValidateNewOutboxPayload(entity) {
 		validation := ValidateSyncMutationPayload(entity, op, string(encoded), entityKey)
 		if validation.ReasonCode != "" {
 			if shouldSkipProjectlessSessionUpsert(entity, op, project, validation) {
@@ -4872,8 +4889,20 @@ func shouldSkipProjectlessSessionUpsert(entity, op, project string, validation S
 	return shouldSkipPartialLocalSessionUpsert(validation)
 }
 
-func shouldValidateNewSessionOutboxPayload(entity string) bool {
-	return strings.TrimSpace(entity) == SyncEntitySession
+func shouldValidateNewOutboxPayload(entity string) bool {
+	switch strings.TrimSpace(entity) {
+	case SyncEntitySession, SyncEntityObservation:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldSkipProjectlessObservationMutation(entity, project string) bool {
+	if strings.TrimSpace(project) != "" {
+		return false
+	}
+	return strings.TrimSpace(entity) == SyncEntityObservation
 }
 
 func syncTargetKeyForProject(project string) string {

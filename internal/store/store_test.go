@@ -4728,6 +4728,99 @@ func TestSessionOutboxSkipsLocalPartialAndRejectsCloudBoundInvalid(t *testing.T)
 	})
 }
 
+func TestObservationOutboxSkipsLocalProjectlessAndRejectsCloudBoundInvalid(t *testing.T) {
+	t.Run("projectless partial observation add persists locally without outbox", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("projectless-observation-add-session", "", "/tmp/projectless-observation"); err != nil {
+			t.Fatalf("create projectless session: %v", err)
+		}
+
+		obsID, err := s.AddObservation(AddObservationParams{SessionID: "projectless-observation-add-session", Type: " ", Title: " ", Content: " ", Scope: "project"})
+		if err != nil {
+			t.Fatalf("add projectless partial observation: %v", err)
+		}
+		obs, err := s.GetObservation(obsID)
+		if err != nil {
+			t.Fatalf("get projectless partial observation: %v", err)
+		}
+		if derefString(obs.Project) != "" || obs.Type != "" || obs.Title != "" || obs.Content != "" {
+			t.Fatalf("expected trimmed projectless partial observation to persist locally, got %+v", obs)
+		}
+		assertNoSyncMutationForKey(t, s, obs.SyncID)
+	})
+
+	t.Run("projectless partial observation update persists locally without outbox", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("projectless-observation-update-session", "", "/tmp/projectless-observation"); err != nil {
+			t.Fatalf("create projectless session: %v", err)
+		}
+		obsID, err := s.AddObservation(AddObservationParams{SessionID: "projectless-observation-update-session", Type: "note", Title: "Local title", Content: "Local content", Scope: "project"})
+		if err != nil {
+			t.Fatalf("add projectless observation: %v", err)
+		}
+
+		empty := " "
+		obs, err := s.UpdateObservation(obsID, UpdateObservationParams{Type: &empty, Title: &empty, Content: &empty})
+		if err != nil {
+			t.Fatalf("update projectless partial observation: %v", err)
+		}
+		if derefString(obs.Project) != "" || obs.Type != "" || obs.Title != "" || obs.Content != "" {
+			t.Fatalf("expected trimmed projectless partial update to persist locally, got %+v", obs)
+		}
+		assertNoSyncMutationForKey(t, s, obs.SyncID)
+	})
+
+	t.Run("project scoped invalid add fails without outbox", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("invalid-observation-add-session", "invalid-proj", "/tmp/invalid"); err != nil {
+			t.Fatalf("create project session: %v", err)
+		}
+
+		_, err := s.AddObservation(AddObservationParams{SessionID: "invalid-observation-add-session", Type: " ", Title: "title", Content: "content", Project: "invalid-proj", Scope: "project"})
+		if err == nil || !strings.Contains(err.Error(), "observation payload missing required fields: type") {
+			t.Fatalf("expected invalid observation add to fail loudly, got %v", err)
+		}
+		if got := countSyncMutationRows(t, s, `entity = ? AND project = ?`, SyncEntityObservation, "invalid-proj"); got != 0 {
+			t.Fatalf("expected no invalid observation outbox mutation, got %d", got)
+		}
+	})
+
+	t.Run("project scoped invalid update fails without new outbox", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("invalid-observation-update-session", "invalid-proj", "/tmp/invalid"); err != nil {
+			t.Fatalf("create project session: %v", err)
+		}
+		obsID, err := s.AddObservation(AddObservationParams{SessionID: "invalid-observation-update-session", Type: "note", Title: "title", Content: "content", Project: "invalid-proj", Scope: "project"})
+		if err != nil {
+			t.Fatalf("add valid observation: %v", err)
+		}
+		before := countSyncMutationRows(t, s, `entity = ? AND project = ?`, SyncEntityObservation, "invalid-proj")
+
+		empty := " "
+		_, err = s.UpdateObservation(obsID, UpdateObservationParams{Content: &empty})
+		if err == nil || !strings.Contains(err.Error(), "observation content is required") {
+			t.Fatalf("expected invalid observation update to fail loudly, got %v", err)
+		}
+		after := countSyncMutationRows(t, s, `entity = ? AND project = ?`, SyncEntityObservation, "invalid-proj")
+		if after != before {
+			t.Fatalf("expected invalid update not to enqueue mutation, before=%d after=%d", before, after)
+		}
+	})
+
+	t.Run("central enqueue rejects project scoped invalid observation", func(t *testing.T) {
+		s := newTestStore(t)
+		entityKey := "central-invalid-observation"
+		project := "central-proj"
+		err := s.withTx(func(tx *sql.Tx) error {
+			return s.enqueueSyncMutationTx(tx, SyncEntityObservation, entityKey, SyncOpUpsert, syncObservationPayload{SyncID: entityKey, SessionID: "central-invalid-session", Type: "note", Project: &project, Scope: "project"})
+		})
+		if err == nil || !strings.Contains(err.Error(), "observation payload missing required fields: title, content") {
+			t.Fatalf("expected central validation failure for invalid observation upsert, got %v", err)
+		}
+		assertNoSyncMutationForKey(t, s, entityKey)
+	})
+}
+
 func TestTruncateUTF8(t *testing.T) {
 	tests := []struct {
 		name string
