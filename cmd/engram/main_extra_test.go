@@ -945,6 +945,54 @@ func TestCmdSyncCloudPreflightsLegacyMutationPayloads(t *testing.T) {
 	}
 }
 
+func seedRepairableLegacyObservationMutation(t *testing.T, cfg store.Config, project string) string {
+	t.Helper()
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	sessionID := project + "-legacy-s1"
+	if err := s.CreateSession(sessionID, project, "/tmp/"+project); err != nil {
+		_ = s.Close()
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{SessionID: sessionID, Type: "decision", Title: "Authoritative title", Content: "Authoritative content", Project: project, Scope: "project"}); err != nil {
+		_ = s.Close()
+		t.Fatalf("add observation: %v", err)
+	}
+	if err := s.EnrollProject(project); err != nil {
+		_ = s.Close()
+		t.Fatalf("enroll project: %v", err)
+	}
+	_ = s.Close()
+
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer db.Close()
+
+	var syncID string
+	if err := db.QueryRow(`SELECT sync_id FROM observations WHERE session_id = ? ORDER BY id DESC LIMIT 1`, sessionID).Scan(&syncID); err != nil {
+		t.Fatalf("lookup sync id: %v", err)
+	}
+	payload := `{"sync_id":"` + syncID + `","session_id":"` + sessionID + `","type":"decision","content":"legacy payload missing title","scope":"project"}`
+	if _, err := db.Exec(
+		`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		store.DefaultSyncTargetKey,
+		store.SyncEntityObservation,
+		syncID,
+		store.SyncOpUpsert,
+		payload,
+		store.SyncSourceLocal,
+		project,
+	); err != nil {
+		t.Fatalf("insert legacy mutation: %v", err)
+	}
+	return syncID
+}
+
 func TestCmdCloudUpgradeBootstrapStatusAndRollbackSemantics(t *testing.T) {
 	stubExitWithPanic(t)
 	stubRuntimeHooks(t)
@@ -1075,6 +1123,77 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 		}
 		if !strings.Contains(stdout, "class: blocked") || !strings.Contains(stdout, "applied: false") {
 			t.Fatalf("expected deterministic blocked dry-run output, got %q", stdout)
+		}
+	})
+
+	t.Run("repair default dry-run is explicit local-only and summarizes findings", func(t *testing.T) {
+		cfg := testConfig(t)
+		seedRepairableLegacyObservationMutation(t, cfg, "proj-a")
+
+		withArgs(t, "engram", "cloud", "upgrade", "repair", "--project", "proj-a")
+		stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+		if recovered != nil || stderr != "" {
+			t.Fatalf("repair dry-run should succeed, panic=%v stderr=%q", recovered, stderr)
+		}
+		for _, want := range []string{
+			"mode: dry-run",
+			"dry_run: true",
+			"local_only: true",
+			"applied: false",
+			"findings_total: 1",
+			"findings_repairable: 1",
+			"findings_blocked: 0",
+			"finding[0].seq:",
+			"finding[0].entity: observation",
+			"finding[0].op: upsert",
+			"finding[0].repairable: true",
+			"finding[0].project: proj-a",
+			"finding[0].entity_key:",
+			"finding[0].missing_fields: title",
+		} {
+			if !strings.Contains(stdout, want) {
+				t.Fatalf("expected repair output to include %q, got %q", want, stdout)
+			}
+		}
+		if strings.Contains(stdout, "Authoritative content") || strings.Contains(stdout, "legacy payload missing title") {
+			t.Fatalf("repair output must not dump payload content, got %q", stdout)
+		}
+	})
+
+	t.Run("repair explicit dry-run is accepted", func(t *testing.T) {
+		cfg := testConfig(t)
+		seedRepairableLegacyObservationMutation(t, cfg, "proj-a")
+
+		withArgs(t, "engram", "cloud", "upgrade", "repair", "--project", "proj-a", "--dry-run")
+		stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+		if recovered != nil || stderr != "" {
+			t.Fatalf("explicit repair dry-run should succeed, panic=%v stderr=%q", recovered, stderr)
+		}
+		if !strings.Contains(stdout, "mode: dry-run") || !strings.Contains(stdout, "dry_run: true") || !strings.Contains(stdout, "local_only: true") {
+			t.Fatalf("expected explicit dry-run local-only output, got %q", stdout)
+		}
+	})
+
+	t.Run("repair apply output is explicit when legacy payload apply is deferred", func(t *testing.T) {
+		cfg := testConfig(t)
+		seedRepairableLegacyObservationMutation(t, cfg, "proj-a")
+
+		withArgs(t, "engram", "cloud", "upgrade", "repair", "--project", "proj-a", "--apply")
+		stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+		if recovered != nil || stderr != "" {
+			t.Fatalf("repair apply should succeed, panic=%v stderr=%q", recovered, stderr)
+		}
+		for _, want := range []string{
+			"mode: apply",
+			"dry_run: false",
+			"local_only: true",
+			"applied: false",
+			"planned_action: report_legacy_mutation_payloads_deferred",
+			"findings_total: 1",
+		} {
+			if !strings.Contains(stdout, want) {
+				t.Fatalf("expected apply output to include %q, got %q", want, stdout)
+			}
 		}
 	})
 

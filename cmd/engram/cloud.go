@@ -389,6 +389,7 @@ func cmdCloudUpgradeRepair(cfg store.Config) {
 		return
 	}
 	apply := hasCloudUpgradeFlag(os.Args[4:], "--apply")
+	dryRun := !apply
 	s, err := storeNew(cfg)
 	if err != nil {
 		fatal(err)
@@ -401,10 +402,47 @@ func cmdCloudUpgradeRepair(cfg store.Config) {
 		return
 	}
 	fmt.Printf("project: %s\n", project)
+	if dryRun {
+		fmt.Println("mode: dry-run")
+	} else {
+		fmt.Println("mode: apply")
+	}
+	fmt.Printf("dry_run: %t\n", dryRun)
+	fmt.Println("local_only: true")
 	fmt.Printf("class: %s\n", report.Class)
 	fmt.Printf("reason_code: %s\n", report.ReasonCode)
 	fmt.Printf("message: %s\n", report.Message)
+	if strings.TrimSpace(report.PlannedAction) != "" {
+		fmt.Printf("planned_action: %s\n", report.PlannedAction)
+	}
 	fmt.Printf("applied: %t\n", report.Applied)
+	printCloudUpgradeRepairFindings(report.Findings)
+}
+
+func printCloudUpgradeRepairFindings(findings []store.CloudUpgradeLegacyMutationFinding) {
+	repairableCount := 0
+	for _, finding := range findings {
+		if finding.Repairable {
+			repairableCount++
+		}
+	}
+	fmt.Printf("findings_total: %d\n", len(findings))
+	fmt.Printf("findings_repairable: %d\n", repairableCount)
+	fmt.Printf("findings_blocked: %d\n", len(findings)-repairableCount)
+	for i, finding := range findings {
+		prefix := fmt.Sprintf("finding[%d]", i)
+		fmt.Printf("%s.seq: %d\n", prefix, finding.Seq)
+		fmt.Printf("%s.entity: %s\n", prefix, finding.Entity)
+		fmt.Printf("%s.op: %s\n", prefix, finding.Op)
+		fmt.Printf("%s.repairable: %t\n", prefix, finding.Repairable)
+		fmt.Printf("%s.project: %s\n", prefix, finding.Project)
+		fmt.Printf("%s.entity_key: %s\n", prefix, finding.EntityKey)
+		if len(finding.MissingFields) > 0 {
+			fmt.Printf("%s.missing_fields: %s\n", prefix, strings.Join(finding.MissingFields, ","))
+		} else {
+			fmt.Printf("%s.missing_fields: \n", prefix)
+		}
+	}
 }
 
 func cmdCloudUpgradeBootstrap(cfg store.Config) {
