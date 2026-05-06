@@ -140,7 +140,7 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 	}
 	findings := make([]Finding, 0)
 	for _, mutation := range mutations {
-		validation := store.ValidateSyncMutationPayload(mutation.Entity, mutation.Op, mutation.Payload, mutation.EntityKey)
+		validation := store.ValidateSyncMutationPayloadForProject(mutation.Entity, mutation.Op, mutation.Payload, mutation.EntityKey, mutation.Project)
 		if validation.ReasonCode == "" {
 			continue
 		}

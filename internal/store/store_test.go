@@ -6868,6 +6868,61 @@ func TestListPendingProjectMutationsAndPayloadValidation(t *testing.T) {
 	}
 }
 
+func TestListPendingProjectMutationsProjectlessDiagnostics(t *testing.T) {
+	tests := []struct {
+		name    string
+		project string
+	}{
+		{name: "specific project", project: "engram"},
+		{name: "all projects", project: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			fixtures := []struct {
+				entity    string
+				entityKey string
+				payload   string
+			}{
+				{entity: SyncEntitySession, entityKey: tc.name + " session", payload: `{"id":"projectless-complete","project":"engram","directory":"/tmp/engram"}`},
+				{entity: SyncEntityObservation, entityKey: tc.name + " observation", payload: `{"sync_id":"projectless-complete-obs","session_id":"projectless-complete","type":"decision","title":"Complete","content":"Complete content","scope":"project"}`},
+				{entity: SyncEntityPrompt, entityKey: tc.name + " prompt", payload: `{}`},
+				{entity: SyncEntityRelation, entityKey: tc.name + " relation", payload: `{}`},
+			}
+			for _, fixture := range fixtures {
+				if _, err := s.execHook(s.db,
+					`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, '')`,
+					DefaultSyncTargetKey, fixture.entity, fixture.entityKey, SyncOpUpsert, fixture.payload, SyncSourceLocal,
+				); err != nil {
+					t.Fatalf("insert projectless %s mutation: %v", fixture.entity, err)
+				}
+			}
+
+			mutations, err := s.ListPendingProjectMutations(tc.project)
+			if err != nil {
+				t.Fatalf("ListPendingProjectMutations: %v", err)
+			}
+			if len(mutations) != 2 {
+				t.Fatalf("expected projectless session/observation only, got %+v", mutations)
+			}
+			seen := map[string]bool{}
+			for _, mutation := range mutations {
+				seen[mutation.Entity] = true
+				if mutation.Entity == SyncEntityPrompt || mutation.Entity == SyncEntityRelation {
+					t.Fatalf("projectless prompt/relation leaked into diagnostics: %+v", mutation)
+				}
+				validation := ValidateSyncMutationPayloadForProject(mutation.Entity, mutation.Op, mutation.Payload, mutation.EntityKey, mutation.Project)
+				if validation.ReasonCode != "sync_mutation_payload_missing_required_fields" || strings.Join(validation.MissingFields, ",") != "mutation.project" {
+					t.Fatalf("expected projectless mutation.project validation, got %+v", validation)
+				}
+			}
+			if !seen[SyncEntitySession] || !seen[SyncEntityObservation] {
+				t.Fatalf("expected projectless session/observation to remain visible, got %+v", mutations)
+			}
+		})
+	}
+}
+
 func TestReadSQLiteLockSnapshotDoesNotMutateApplicationRows(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("s1", "engram", "/work/engram"); err != nil {

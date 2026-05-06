@@ -109,8 +109,12 @@ func (s *Store) listPendingProjectMutationsTxLike(q rowQuerier, project string) 
 		WHERE target_key = ? AND acked_at IS NULL`
 	args := []any{DefaultSyncTargetKey}
 	if project != "" {
-		query += ` AND project = ?`
+		query += ` AND (project = ? OR (project = '' AND entity IN (?, ?)))`
 		args = append(args, project)
+		args = append(args, SyncEntitySession, SyncEntityObservation)
+	} else {
+		query += ` AND NOT (project = '' AND entity IN (?, ?))`
+		args = append(args, SyncEntityPrompt, SyncEntityRelation)
 	}
 	query += ` ORDER BY seq ASC`
 	rows, err := q.Query(query, args...)
@@ -175,6 +179,7 @@ func ValidateSyncMutationPayload(entity, op, payload, entityKey string) SyncMuta
 			missing = append(missing, "id")
 		}
 		if op == SyncOpUpsert {
+			require("project")
 			require("directory")
 		}
 	case SyncEntityObservation:
@@ -217,6 +222,36 @@ func ValidateSyncMutationPayload(entity, op, payload, entityKey string) SyncMuta
 		result.Message = fmt.Sprintf("%s payload missing required fields: %s", entity, strings.Join(missing, ", "))
 	}
 	return result
+}
+
+// ValidateSyncMutationPayloadForProject extends payload validation with the
+// sync_mutations.project column. Project-scoped diagnostics need this because a
+// session/observation payload can be complete while the mutation row itself is
+// still projectless and therefore unsafe for cloud upgrade replay.
+func ValidateSyncMutationPayloadForProject(entity, op, payload, entityKey, mutationProject string) SyncMutationPayloadValidation {
+	validation := ValidateSyncMutationPayload(entity, op, payload, entityKey)
+	if strings.TrimSpace(mutationProject) != "" {
+		return validation
+	}
+
+	switch strings.TrimSpace(entity) {
+	case SyncEntitySession, SyncEntityObservation:
+		validation.MissingFields = appendMissingDiagnosticField(validation.MissingFields, "mutation.project")
+		if validation.ReasonCode == "" || validation.ReasonCode == "sync_mutation_payload_missing_required_fields" {
+			validation.ReasonCode = "sync_mutation_payload_missing_required_fields"
+			validation.Message = fmt.Sprintf("%s mutation missing required fields: %s", strings.TrimSpace(entity), strings.Join(validation.MissingFields, ", "))
+		}
+	}
+	return validation
+}
+
+func appendMissingDiagnosticField(fields []string, field string) []string {
+	for _, existing := range fields {
+		if existing == field {
+			return fields
+		}
+	}
+	return append(fields, field)
 }
 
 // ReadSQLiteLockSnapshot returns SQLite lock-related PRAGMA values without
