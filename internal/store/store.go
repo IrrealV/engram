@@ -298,11 +298,12 @@ type CloudUpgradeState struct {
 }
 
 type CloudUpgradeRepairReport struct {
-	Class         string `json:"class"`
-	ReasonCode    string `json:"reason_code"`
-	Message       string `json:"message"`
-	PlannedAction string `json:"planned_action,omitempty"`
-	Applied       bool   `json:"applied"`
+	Class         string                              `json:"class"`
+	ReasonCode    string                              `json:"reason_code"`
+	Message       string                              `json:"message"`
+	PlannedAction string                              `json:"planned_action,omitempty"`
+	Applied       bool                                `json:"applied"`
+	Findings      []CloudUpgradeLegacyMutationFinding `json:"findings,omitempty"`
 }
 
 type CloudUpgradeLegacyMutationFinding struct {
@@ -1225,35 +1226,24 @@ func (s *Store) RepairCloudUpgrade(project string, apply bool) (CloudUpgradeRepa
 		return CloudUpgradeRepairReport{}, fmt.Errorf("diagnose legacy cloud upgrade mutations: %w", err)
 	}
 	if legacyReport.BlockedCount > 0 {
-		first := legacyReport.Findings[0]
+		first := firstBlockedLegacyMutationFinding(legacyReport.Findings)
 		return CloudUpgradeRepairReport{
 			Class:      UpgradeRepairClassBlocked,
 			ReasonCode: UpgradeReasonBlockedLegacyMutationManual,
 			Message:    fmt.Sprintf("manual-action-required: %s (seq=%d entity=%s op=%s)", first.Message, first.Seq, first.Entity, first.Op),
 			Applied:    false,
+			Findings:   legacyReport.Findings,
 		}, nil
 	}
 	if legacyReport.RepairableCount > 0 {
 		report := CloudUpgradeRepairReport{
 			Class:         UpgradeRepairClassRepairable,
 			ReasonCode:    UpgradeReasonRepairableLegacyMutationPayload,
-			Message:       fmt.Sprintf("project %q has %d repairable legacy mutation payload issue(s)", project, legacyReport.RepairableCount),
-			PlannedAction: "repair_legacy_mutation_payloads",
+			Message:       fmt.Sprintf("project %q has %d repairable legacy mutation payload issue(s); legacy mutation payload apply is deferred", project, legacyReport.RepairableCount),
+			PlannedAction: "report_legacy_mutation_payloads_deferred",
 			Applied:       false,
+			Findings:      legacyReport.Findings,
 		}
-		if !apply {
-			return report, nil
-		}
-		if err := s.applyCloudUpgradeLegacyMutationRepairs(project); err != nil {
-			return CloudUpgradeRepairReport{}, fmt.Errorf("apply cloud upgrade legacy mutation repairs: %w", err)
-		}
-		report.Applied = true
-		report.Message = fmt.Sprintf("applied deterministic legacy mutation payload repairs for project %q", project)
-		_ = s.SaveCloudUpgradeState(CloudUpgradeState{
-			Project:     project,
-			Stage:       UpgradeStageRepairApplied,
-			RepairClass: UpgradeRepairClassRepairable,
-		})
 		return report, nil
 	}
 
@@ -1294,11 +1284,22 @@ func (s *Store) RepairCloudUpgrade(project string, apply bool) (CloudUpgradeRepa
 	return report, nil
 }
 
+func firstBlockedLegacyMutationFinding(findings []CloudUpgradeLegacyMutationFinding) CloudUpgradeLegacyMutationFinding {
+	for _, finding := range findings {
+		if !finding.Repairable {
+			return finding
+		}
+	}
+	if len(findings) == 0 {
+		return CloudUpgradeLegacyMutationFinding{Message: "legacy mutation requires manual action"}
+	}
+	return findings[0]
+}
+
 type cloudUpgradeLegacyMutationEvaluation struct {
-	finding         CloudUpgradeLegacyMutationFinding
-	hasIssue        bool
-	repairedPayload string
-	canRepair       bool
+	finding   CloudUpgradeLegacyMutationFinding
+	hasIssue  bool
+	canRepair bool
 }
 
 func (s *Store) DiagnoseCloudUpgradeLegacyMutations(project string) (CloudUpgradeLegacyMutationReport, error) {
@@ -1317,47 +1318,14 @@ func (s *Store) DiagnoseCloudUpgradeLegacyMutations(project string) (CloudUpgrad
 		if !eval.hasIssue {
 			continue
 		}
-		report.Findings = append(report.Findings, eval.finding)
 		if eval.canRepair {
 			report.RepairableCount++
 		} else {
 			report.BlockedCount++
 		}
+		report.Findings = append(report.Findings, eval.finding)
 	}
 	return report, nil
-}
-
-func (s *Store) applyCloudUpgradeLegacyMutationRepairs(project string) error {
-	project, _ = NormalizeProject(project)
-	project = strings.TrimSpace(project)
-	if project == "" {
-		return nil
-	}
-	return s.withTx(func(tx *sql.Tx) error {
-		mutations, err := s.listPendingProjectMutationsTx(tx, project)
-		if err != nil {
-			return err
-		}
-		for _, mutation := range mutations {
-			eval, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, mutation)
-			if err != nil {
-				return err
-			}
-			if !eval.hasIssue || !eval.canRepair || strings.TrimSpace(eval.repairedPayload) == "" {
-				continue
-			}
-			if _, err := s.execHook(tx,
-				`UPDATE sync_mutations SET payload = ? WHERE target_key = ? AND project = ? AND seq = ? AND acked_at IS NULL`,
-				eval.repairedPayload,
-				DefaultSyncTargetKey,
-				project,
-				mutation.Seq,
-			); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
 }
 
 func (s *Store) evaluateCloudUpgradeLegacyMutations(project string) ([]cloudUpgradeLegacyMutationEvaluation, error) {
@@ -1422,13 +1390,13 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		Project:   strings.TrimSpace(mutation.Project),
 	}
 
-	repairable := func(msg, hint string, repairedPayload string) cloudUpgradeLegacyMutationEvaluation {
+	repairable := func(msg, hint string) cloudUpgradeLegacyMutationEvaluation {
 		finding := base
 		finding.Repairable = true
 		finding.ReasonCode = UpgradeReasonRepairableLegacyMutationPayload
 		finding.Message = msg
 		finding.RepairHint = hint
-		return cloudUpgradeLegacyMutationEvaluation{finding: finding, hasIssue: true, canRepair: true, repairedPayload: repairedPayload}
+		return cloudUpgradeLegacyMutationEvaluation{finding: finding, hasIssue: true, canRepair: true}
 	}
 	blocked := func(code, msg string) cloudUpgradeLegacyMutationEvaluation {
 		finding := base
@@ -1482,11 +1450,7 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		if !changed {
 			return cloudUpgradeLegacyMutationEvaluation{}, nil
 		}
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return cloudUpgradeLegacyMutationEvaluation{}, err
-		}
-		return repairable("session payload is missing required fields", "repair fills session id/directory from local sessions table", string(encoded)), nil
+		return repairable("session payload is missing required fields", "repair fills session id/directory from local sessions table"), nil
 
 	case SyncEntityObservation:
 		var body syncObservationPayload
@@ -1558,11 +1522,7 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		if !changed {
 			return cloudUpgradeLegacyMutationEvaluation{}, nil
 		}
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return cloudUpgradeLegacyMutationEvaluation{}, err
-		}
-		return repairable("observation payload is missing required fields for canonical bootstrap", "repair fills missing observation fields from local observations table", string(encoded)), nil
+		return repairable("observation payload is missing required fields for canonical bootstrap", "repair fills missing observation fields from local observations table"), nil
 
 	case SyncEntityPrompt:
 		var body syncPromptPayload
@@ -1614,11 +1574,7 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		if !changed {
 			return cloudUpgradeLegacyMutationEvaluation{}, nil
 		}
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return cloudUpgradeLegacyMutationEvaluation{}, err
-		}
-		return repairable("prompt payload is missing required fields for canonical bootstrap", "repair fills missing prompt fields from local prompts table", string(encoded)), nil
+		return repairable("prompt payload is missing required fields for canonical bootstrap", "repair fills missing prompt fields from local prompts table"), nil
 	}
 
 	return cloudUpgradeLegacyMutationEvaluation{}, nil
