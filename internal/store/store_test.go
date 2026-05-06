@@ -75,6 +75,26 @@ func insertLegacyMutation(t *testing.T, s *Store, fixture legacyMutationFixture)
 	return seq
 }
 
+func countSyncMutationRows(t *testing.T, s *Store, where string, args ...any) int {
+	t.Helper()
+	query := `SELECT COUNT(*) FROM sync_mutations`
+	if where != "" {
+		query += ` WHERE ` + where
+	}
+	var count int
+	if err := s.db.QueryRow(query, args...).Scan(&count); err != nil {
+		t.Fatalf("count sync mutations: %v", err)
+	}
+	return count
+}
+
+func assertNoSyncMutationForKey(t *testing.T, s *Store, entityKey string) {
+	t.Helper()
+	if got := countSyncMutationRows(t, s, `entity_key = ?`, entityKey); got != 0 {
+		t.Fatalf("expected no sync mutation for %s, got %d", entityKey, got)
+	}
+}
+
 func findLegacyFinding(t *testing.T, report CloudUpgradeLegacyMutationReport, entityKey string) CloudUpgradeLegacyMutationFinding {
 	t.Helper()
 	for _, finding := range report.Findings {
@@ -4564,19 +4584,32 @@ func TestCreateSessionDoesNotOverwriteExistingProject(t *testing.T) {
 }
 
 func TestCreateSessionPartialUpsert(t *testing.T) {
-	s := newTestStore(t)
-
-	t.Run("fills directory when project already set", func(t *testing.T) {
+	t.Run("project scoped upsert with empty directory persists without outbox", func(t *testing.T) {
+		s := newTestStore(t)
 		if err := s.CreateSession("sess-partial-1", "myproject", ""); err != nil {
-			t.Fatalf("create: %v", err)
-		}
-		// Second call fills directory but project stays
-		if err := s.CreateSession("sess-partial-1", "other", "/new/dir"); err != nil {
-			t.Fatalf("upsert: %v", err)
+			t.Fatalf("create partial project-scoped session: %v", err)
 		}
 		sess, err := s.GetSession("sess-partial-1")
 		if err != nil {
-			t.Fatalf("get: %v", err)
+			t.Fatalf("get partial session: %v", err)
+		}
+		if sess.Project != "myproject" || sess.Directory != "" {
+			t.Fatalf("partial session persisted incorrectly: %+v", sess)
+		}
+		assertNoSyncMutationForKey(t, s, "sess-partial-1")
+	})
+
+	t.Run("fills directory when project already set and enqueues persisted state", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("sess-partial-fill", "myproject", ""); err != nil {
+			t.Fatalf("create partial session: %v", err)
+		}
+		if err := s.CreateSession("sess-partial-fill", "other", "/new/dir"); err != nil {
+			t.Fatalf("fill directory: %v", err)
+		}
+		sess, err := s.GetSession("sess-partial-fill")
+		if err != nil {
+			t.Fatalf("get filled session: %v", err)
 		}
 		if sess.Project != "myproject" {
 			t.Fatalf("project should be preserved, got %q", sess.Project)
@@ -4584,9 +4617,26 @@ func TestCreateSessionPartialUpsert(t *testing.T) {
 		if sess.Directory != "/new/dir" {
 			t.Fatalf("directory should be filled, got %q", sess.Directory)
 		}
+
+		var payloadRaw string
+		if err := s.db.QueryRow(
+			`SELECT payload FROM sync_mutations WHERE entity = ? AND entity_key = ? ORDER BY seq DESC LIMIT 1`,
+			SyncEntitySession,
+			"sess-partial-fill",
+		).Scan(&payloadRaw); err != nil {
+			t.Fatalf("query filled session mutation payload: %v", err)
+		}
+		var payload syncSessionPayload
+		if err := json.Unmarshal([]byte(payloadRaw), &payload); err != nil {
+			t.Fatalf("unmarshal filled session payload: %v", err)
+		}
+		if payload.Project != sess.Project || payload.Directory != sess.Directory || payload.StartedAt != sess.StartedAt {
+			t.Fatalf("payload should match final persisted session, payload=%+v session=%+v", payload, sess)
+		}
 	})
 
-	t.Run("fills project when directory already set", func(t *testing.T) {
+	t.Run("fills project when directory already set and enqueues persisted state", func(t *testing.T) {
+		s := newTestStore(t)
 		if err := s.CreateSession("sess-partial-2", "", "/existing/dir"); err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -4603,9 +4653,26 @@ func TestCreateSessionPartialUpsert(t *testing.T) {
 		if sess.Directory != "/existing/dir" {
 			t.Fatalf("directory should be preserved, got %q", sess.Directory)
 		}
+
+		var payloadRaw string
+		if err := s.db.QueryRow(
+			`SELECT payload FROM sync_mutations WHERE entity = ? AND entity_key = ? ORDER BY seq DESC LIMIT 1`,
+			SyncEntitySession,
+			"sess-partial-2",
+		).Scan(&payloadRaw); err != nil {
+			t.Fatalf("query latest session mutation payload: %v", err)
+		}
+		var payload syncSessionPayload
+		if err := json.Unmarshal([]byte(payloadRaw), &payload); err != nil {
+			t.Fatalf("unmarshal latest session payload: %v", err)
+		}
+		if payload.Project != sess.Project || payload.Directory != sess.Directory || payload.StartedAt != sess.StartedAt {
+			t.Fatalf("payload should match persisted session, payload=%+v session=%+v", payload, sess)
+		}
 	})
 
 	t.Run("both empty stays empty", func(t *testing.T) {
+		s := newTestStore(t)
 		if err := s.CreateSession("sess-partial-3", "", ""); err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -4622,6 +4689,42 @@ func TestCreateSessionPartialUpsert(t *testing.T) {
 		if sess.Directory != "" {
 			t.Fatalf("directory should stay empty, got %q", sess.Directory)
 		}
+		assertNoSyncMutationForKey(t, s, "sess-partial-3")
+	})
+}
+
+func TestSessionOutboxSkipsLocalPartialAndRejectsCloudBoundInvalid(t *testing.T) {
+	t.Run("ending local partial session does not enqueue invalid outbox", func(t *testing.T) {
+		s := newTestStore(t)
+		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, '', datetime('now'))`, "partial-ended-session", "partial-proj"); err != nil {
+			t.Fatalf("seed partial session: %v", err)
+		}
+		if err := s.EndSession("partial-ended-session", "local summary"); err != nil {
+			t.Fatalf("end partial session: %v", err)
+		}
+		sess, err := s.GetSession("partial-ended-session")
+		if err != nil {
+			t.Fatalf("get ended partial session: %v", err)
+		}
+		if sess.EndedAt == nil || sess.Summary == nil || *sess.Summary != "local summary" {
+			t.Fatalf("expected partial session to end locally, got %+v", sess)
+		}
+		assertNoSyncMutationForKey(t, s, "partial-ended-session")
+	})
+
+	t.Run("central enqueue rejects project scoped invalid session", func(t *testing.T) {
+		s := newTestStore(t)
+		entityKey := "central-invalid-session"
+		err := s.withTx(func(tx *sql.Tx) error {
+			return s.enqueueSyncMutationTx(tx, SyncEntitySession, entityKey, SyncOpUpsert, syncSessionPayload{
+				ID:      entityKey,
+				Project: "central-proj",
+			})
+		})
+		if err == nil || !strings.Contains(err.Error(), "session payload missing required fields: directory") {
+			t.Fatalf("expected central validation failure for invalid session upsert, got %v", err)
+		}
+		assertNoSyncMutationForKey(t, s, entityKey)
 	})
 }
 
@@ -5893,31 +5996,22 @@ func TestSkipAckPreservesEnrolledProjectMutations(t *testing.T) {
 	}
 }
 
-// ─── Phase 5: Empty/global project always syncs ──────────────────────────────
+// ─── Phase 5: Empty/global project sync filtering ────────────────────────────
 
-func TestEmptyProjectMutationsAlwaysSync(t *testing.T) {
+func TestEmptyProjectSessionDoesNotEnqueueInvalidSyncMutation(t *testing.T) {
 	s := newTestStore(t)
 
-	// Create a session with empty project (global).
 	if err := s.CreateSession("global-session", "", "/tmp"); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 
-	// No projects enrolled, but empty-project mutations should still appear.
 	mutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 100)
 	if err != nil {
 		t.Fatalf("list pending: %v", err)
 	}
 
-	if len(mutations) == 0 {
-		t.Fatal("expected empty-project mutations to always sync regardless of enrollment")
-	}
-
-	// Verify they have project = ''.
-	for _, m := range mutations {
-		if m.Project != "" {
-			t.Fatalf("expected empty project, got %q", m.Project)
-		}
+	if len(mutations) != 0 {
+		t.Fatalf("expected projectless session not to enqueue pending sync mutations, got %+v", mutations)
 	}
 }
 
@@ -5978,7 +6072,7 @@ func TestMixedEnrolledAndEmptyProjectMutations(t *testing.T) {
 		t.Fatalf("list pending: %v", err)
 	}
 
-	// Should have enrolled-mix and empty-project mutations, but NOT unenrolled-mix.
+	// Should have enrolled-mix mutations, but NOT unenrolled-mix or projectless session mutations.
 	var hasEnrolled, hasGlobal bool
 	for _, m := range mutations {
 		if m.Project == "unenrolled-mix" {
@@ -5994,8 +6088,8 @@ func TestMixedEnrolledAndEmptyProjectMutations(t *testing.T) {
 	if !hasEnrolled {
 		t.Fatal("expected enrolled-mix mutations to appear")
 	}
-	if !hasGlobal {
-		t.Fatal("expected empty-project (global) mutations to appear")
+	if hasGlobal {
+		t.Fatal("projectless session mutations should not appear")
 	}
 }
 

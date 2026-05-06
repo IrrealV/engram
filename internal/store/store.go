@@ -1799,19 +1799,20 @@ func (s *Store) migrateFTSTopicKey() error {
 func (s *Store) CreateSession(id, project, directory string) error {
 	// Normalize project name before storing
 	project, _ = NormalizeProject(project)
+	directory = strings.TrimSpace(directory)
 
 	return s.withTx(func(tx *sql.Tx) error {
 		if err := s.createSessionTx(tx, id, project, directory); err != nil {
 			return err
 		}
-		var startedAt string
-		if err := tx.QueryRow(`SELECT started_at FROM sessions WHERE id = ?`, id).Scan(&startedAt); err != nil {
+		var persistedProject, persistedDirectory, startedAt string
+		if err := tx.QueryRow(`SELECT project, directory, started_at FROM sessions WHERE id = ?`, id).Scan(&persistedProject, &persistedDirectory, &startedAt); err != nil {
 			return err
 		}
-		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
+		return s.enqueueSessionUpsertFromPersistedStateTx(tx, syncSessionPayload{
 			ID:        id,
-			Project:   project,
-			Directory: directory,
+			Project:   persistedProject,
+			Directory: persistedDirectory,
 			StartedAt: startedAt,
 		})
 	})
@@ -1844,7 +1845,7 @@ func (s *Store) EndSession(id string, summary string) error {
 			return err
 		}
 
-		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
+		return s.enqueueSessionUpsertFromPersistedStateTx(tx, syncSessionPayload{
 			ID:        id,
 			Project:   project,
 			Directory: directory,
@@ -4759,6 +4760,39 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error 
 	return nil
 }
 
+func (s *Store) enqueueSessionUpsertFromPersistedStateTx(tx *sql.Tx, payload syncSessionPayload) error {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	validation := ValidateSyncMutationPayload(SyncEntitySession, SyncOpUpsert, string(encoded), payload.ID)
+	if validation.ReasonCode != "" {
+		if shouldSkipPartialLocalSessionUpsert(validation) {
+			return nil
+		}
+		return fmt.Errorf("invalid sync mutation %s %s for %q: %s", SyncEntitySession, SyncOpUpsert, strings.TrimSpace(payload.ID), validation.Message)
+	}
+	return s.enqueueSyncMutationTx(tx, SyncEntitySession, payload.ID, SyncOpUpsert, payload)
+}
+
+func shouldSkipPartialLocalSessionUpsert(validation SyncMutationPayloadValidation) bool {
+	if validation.ReasonCode != "sync_mutation_payload_missing_required_fields" {
+		return false
+	}
+	if len(validation.MissingFields) == 0 {
+		return false
+	}
+	for _, field := range validation.MissingFields {
+		switch field {
+		case "project", "directory":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, payload any) error {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -4774,6 +4808,15 @@ func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, 
 			} else {
 				project = derived
 			}
+		}
+	}
+	if shouldValidateNewSessionOutboxPayload(entity) {
+		validation := ValidateSyncMutationPayload(entity, op, string(encoded), entityKey)
+		if validation.ReasonCode != "" {
+			if shouldSkipProjectlessSessionUpsert(entity, op, project, validation) {
+				return nil
+			}
+			return fmt.Errorf("invalid sync mutation %s %s for %q: %s", strings.TrimSpace(entity), strings.TrimSpace(op), strings.TrimSpace(entityKey), validation.Message)
 		}
 	}
 	if _, err := s.execHook(tx,
@@ -4820,6 +4863,17 @@ func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, 
 		SyncLifecyclePending, seq, projectTargetKey,
 	)
 	return err
+}
+
+func shouldSkipProjectlessSessionUpsert(entity, op, project string, validation SyncMutationPayloadValidation) bool {
+	if strings.TrimSpace(entity) != SyncEntitySession || strings.TrimSpace(op) != SyncOpUpsert || strings.TrimSpace(project) != "" {
+		return false
+	}
+	return shouldSkipPartialLocalSessionUpsert(validation)
+}
+
+func shouldValidateNewSessionOutboxPayload(entity string) bool {
+	return strings.TrimSpace(entity) == SyncEntitySession
 }
 
 func syncTargetKeyForProject(project string) string {
