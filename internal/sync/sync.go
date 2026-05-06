@@ -21,6 +21,7 @@ package sync
 
 import (
 	"compress/gzip"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,7 +53,6 @@ var (
 	storeAckMutationSeq = func(s *store.Store, targetKey string, seqs []int64) error {
 		return s.AckSyncMutationSeqs(targetKey, seqs)
 	}
-	storeImportData       = func(s *store.Store, d *store.ExportData) (*store.ImportResult, error) { return s.Import(d) }
 	storeApplyPulledChunk = func(s *store.Store, targetKey, chunkID string, mutations []store.SyncMutation) error {
 		return s.ApplyPulledChunk(targetKey, chunkID, mutations)
 	}
@@ -508,81 +508,27 @@ func (sy *Syncer) Import() (*ImportResult, error) {
 		return nil, fmt.Errorf("get synced chunks: %w", err)
 	}
 
-	result := &ImportResult{}
 	entries := manifest.Chunks
 	if sy.cloudMode {
-		return sy.importCloudEntriesDependencySafe(entries, knownChunks)
+		return sy.importEntriesDependencySafe(entries, knownChunks, importModeCloud)
 	}
-
-	for _, entry := range entries {
-		// Skip already-imported chunks
-		if knownChunks[entry.ID] {
-			result.ChunksSkipped++
-			continue
-		}
-
-		// Read the chunk via transport
-		chunkJSON, err := sy.transport.ReadChunk(entry.ID)
-		if err != nil {
-			if errors.Is(err, ErrChunkNotFound) {
-				if sy.cloudMode {
-					return nil, fmt.Errorf("read chunk %s: manifest references missing remote chunk", entry.ID)
-				}
-				result.ChunksSkipped++
-				continue
-			}
-			return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
-		}
-
-		var chunk ChunkData
-		if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
-			return nil, fmt.Errorf("parse chunk %s: %w", entry.ID, err)
-		}
-
-		importResult := &store.ImportResult{}
-		if sy.cloudMode {
-			if err := sy.importCloudChunk(entry.ID, chunk); err != nil {
-				return nil, fmt.Errorf("import chunk %s: %w", entry.ID, err)
-			}
-			importResult = estimateMutationImportResult(chunk)
-		} else {
-			// Import into DB
-			exportData := &store.ExportData{
-				Version:      "0.1.0",
-				ExportedAt:   entry.CreatedAt,
-				Sessions:     chunk.Sessions,
-				Observations: chunk.Observations,
-				Prompts:      chunk.Prompts,
-			}
-
-			legacyResult, err := storeImportData(sy.store, exportData)
-			if err != nil {
-				return nil, fmt.Errorf("import chunk %s: %w", entry.ID, err)
-			}
-			importResult = legacyResult
-		}
-
-		if !sy.cloudMode {
-			// Record this chunk as imported
-			if err := storeRecordSynced(sy.store, sy.chunkTrackingTargetKey(""), entry.ID); err != nil {
-				return nil, fmt.Errorf("record chunk %s: %w", entry.ID, err)
-			}
-		}
-		knownChunks[entry.ID] = true
-
-		result.ChunksImported++
-		result.SessionsImported += importResult.SessionsImported
-		result.ObservationsImported += importResult.ObservationsImported
-		result.PromptsImported += importResult.PromptsImported
-	}
-
-	return result, nil
+	return sy.importEntriesDependencySafe(entries, knownChunks, importModeLocal)
 }
 
-func (sy *Syncer) importCloudEntriesDependencySafe(entries []ChunkEntry, knownChunks map[string]bool) (*ImportResult, error) {
+type importMode string
+
+const (
+	importModeLocal                  importMode = "local"
+	importModeCloud                  importMode = "cloud"
+	recoveredMissingSessionDirectory            = "(recovered-missing-session)"
+	recoveredMissingSessionStartedAt            = "1970-01-01 00:00:00"
+)
+
+func (sy *Syncer) importEntriesDependencySafe(entries []ChunkEntry, knownChunks map[string]bool, mode importMode) (*ImportResult, error) {
 	result := &ImportResult{}
 	pendingEntries := make([]ChunkEntry, 0, len(entries))
 	for _, entry := range entries {
+		// Skip already-imported chunks
 		if knownChunks[entry.ID] {
 			result.ChunksSkipped++
 			continue
@@ -593,6 +539,14 @@ func (sy *Syncer) importCloudEntriesDependencySafe(entries []ChunkEntry, knownCh
 	if len(pendingEntries) == 0 {
 		return result, nil
 	}
+	availableSessionIDs := map[string]struct{}{}
+	if mode == importModeLocal {
+		var err error
+		availableSessionIDs, err = sy.sessionIDsAvailableInChunks(entries, knownChunks)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	lastErrors := map[string]error{}
 	for pass := 1; len(pendingEntries) > 0; pass++ {
@@ -600,10 +554,15 @@ func (sy *Syncer) importCloudEntriesDependencySafe(entries []ChunkEntry, knownCh
 		nextPending := make([]ChunkEntry, 0, len(pendingEntries))
 
 		for _, entry := range pendingEntries {
+			// Read the chunk via transport
 			chunkJSON, err := sy.transport.ReadChunk(entry.ID)
 			if err != nil {
 				if errors.Is(err, ErrChunkNotFound) {
-					return nil, fmt.Errorf("read chunk %s: manifest references missing remote chunk", entry.ID)
+					if mode == importModeCloud {
+						return nil, fmt.Errorf("read chunk %s: manifest references missing remote chunk", entry.ID)
+					}
+					result.ChunksSkipped++
+					continue
 				}
 				return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
 			}
@@ -613,25 +572,44 @@ func (sy *Syncer) importCloudEntriesDependencySafe(entries []ChunkEntry, knownCh
 				return nil, fmt.Errorf("parse chunk %s: %w", entry.ID, err)
 			}
 
-			if err := sy.importCloudChunk(entry.ID, chunk); err != nil {
-				lastErrors[entry.ID] = err
+			if err := sy.importMutationChunk(entry.ID, chunk); err != nil {
+				if mode == importModeLocal {
+					recoveredChunk, recovered, recoveryErr := sy.recoverLocalMissingSessionDependencies(chunk, availableSessionIDs)
+					if recoveryErr != nil {
+						return nil, recoveryErr
+					}
+					if recovered {
+						if retryErr := sy.importMutationChunk(entry.ID, recoveredChunk); retryErr == nil {
+							chunk = recoveredChunk
+							goto imported
+						} else {
+							err = retryErr
+						}
+					}
+				}
+				lastErrors[entry.ID] = importDependencyError(chunk, err)
 				nextPending = append(nextPending, entry)
 				continue
 			}
 
+		imported:
 			importResult := estimateMutationImportResult(chunk)
 			knownChunks[entry.ID] = true
+			delete(lastErrors, entry.ID)
+
 			result.ChunksImported++
 			result.SessionsImported += importResult.SessionsImported
 			result.ObservationsImported += importResult.ObservationsImported
 			result.PromptsImported += importResult.PromptsImported
-			delete(lastErrors, entry.ID)
 			progress = true
 		}
 
 		if !progress {
+			if len(nextPending) == 0 {
+				return result, nil
+			}
 			stalled := nextPending[0]
-			return nil, fmt.Errorf("dependency-safe cloud import stalled after %d pass(es); chunk %s: %w", pass, stalled.ID, lastErrors[stalled.ID])
+			return nil, fmt.Errorf("dependency-safe %s import stalled after %d pass(es); chunk %s: %w", mode, pass, stalled.ID, lastErrors[stalled.ID])
 		}
 
 		pendingEntries = nextPending
@@ -640,10 +618,95 @@ func (sy *Syncer) importCloudEntriesDependencySafe(entries []ChunkEntry, knownCh
 	return result, nil
 }
 
-func (sy *Syncer) importCloudChunk(chunkID string, chunk ChunkData) error {
+func (sy *Syncer) importMutationChunk(chunkID string, chunk ChunkData) error {
 	mutations := buildImportMutations(chunk)
 	mutations = orderMutationsForApply(mutations)
 	return storeApplyPulledChunk(sy.store, sy.chunkTrackingTargetKey(""), chunkID, mutations)
+}
+
+func importDependencyError(chunk ChunkData, err error) error {
+	mutations := buildImportMutations(chunk)
+	referenced := referencedSessionIDsFromNonSessionUpserts(mutations)
+	if len(referenced) == 0 {
+		return err
+	}
+	sessions := make([]string, 0, len(referenced))
+	for sessionID := range referenced {
+		sessions = append(sessions, sessionID)
+	}
+	sort.Strings(sessions)
+	return fmt.Errorf("%w; pending session dependencies: %s", err, strings.Join(sessions, ", "))
+}
+
+func (sy *Syncer) sessionIDsAvailableInChunks(entries []ChunkEntry, knownChunks map[string]bool) (map[string]struct{}, error) {
+	available := make(map[string]struct{})
+	for _, entry := range entries {
+		chunkJSON, err := sy.transport.ReadChunk(entry.ID)
+		if err != nil {
+			if errors.Is(err, ErrChunkNotFound) || knownChunks[entry.ID] {
+				continue
+			}
+			return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
+		}
+
+		var chunk ChunkData
+		if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+			if knownChunks[entry.ID] {
+				continue
+			}
+			return nil, fmt.Errorf("parse chunk %s: %w", entry.ID, err)
+		}
+		for _, mutation := range buildImportMutations(chunk) {
+			if mutation.Entity != store.SyncEntitySession || mutation.Op != store.SyncOpUpsert {
+				continue
+			}
+			sessionID := strings.TrimSpace(mutation.EntityKey)
+			if sessionID != "" {
+				available[sessionID] = struct{}{}
+			}
+		}
+	}
+	return available, nil
+}
+
+func (sy *Syncer) recoverLocalMissingSessionDependencies(chunk ChunkData, availableSessionIDs map[string]struct{}) (ChunkData, bool, error) {
+	mutations := buildImportMutations(chunk)
+	projectsBySession := referencedSessionProjectsFromNonSessionUpserts(mutations)
+	if len(projectsBySession) == 0 {
+		return chunk, false, nil
+	}
+
+	missingIDs := make([]string, 0, len(projectsBySession))
+	for sessionID := range projectsBySession {
+		if _, available := availableSessionIDs[sessionID]; available {
+			continue
+		}
+		_, err := sy.store.GetSession(sessionID)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return chunk, false, fmt.Errorf("check recovered session dependency %s: %w", sessionID, err)
+		}
+		missingIDs = append(missingIDs, sessionID)
+	}
+	if len(missingIDs) == 0 {
+		return chunk, false, nil
+	}
+
+	sort.Strings(missingIDs)
+	recovered := chunk
+	stubSessions := make([]store.Session, 0, len(missingIDs))
+	for _, sessionID := range missingIDs {
+		stubSessions = append(stubSessions, store.Session{
+			ID:        sessionID,
+			Project:   projectsBySession[sessionID],
+			Directory: recoveredMissingSessionDirectory,
+			StartedAt: recoveredMissingSessionStartedAt,
+		})
+	}
+	recovered.Sessions = append(stubSessions, recovered.Sessions...)
+	return recovered, true, nil
 }
 
 func buildImportMutations(chunk ChunkData) []store.SyncMutation {
@@ -736,6 +799,39 @@ func referencedSessionIDsFromNonSessionUpserts(mutations []store.SyncMutation) m
 		}
 	}
 	return required
+}
+
+func referencedSessionProjectsFromNonSessionUpserts(mutations []store.SyncMutation) map[string]string {
+	projects := make(map[string]string)
+	for _, mutation := range mutations {
+		if mutation.Op != store.SyncOpUpsert {
+			continue
+		}
+		switch mutation.Entity {
+		case store.SyncEntityObservation, store.SyncEntityPrompt:
+			var payload struct {
+				SessionID string  `json:"session_id"`
+				Project   *string `json:"project"`
+			}
+			if err := decodeSyncPayloadForProject([]byte(mutation.Payload), &payload); err != nil {
+				continue
+			}
+			sessionID := strings.TrimSpace(payload.SessionID)
+			if sessionID == "" {
+				continue
+			}
+			project, _ := store.NormalizeProject(strings.TrimSpace(mutation.Project))
+			project = strings.TrimSpace(project)
+			if project == "" && payload.Project != nil {
+				project, _ = store.NormalizeProject(strings.TrimSpace(*payload.Project))
+				project = strings.TrimSpace(project)
+			}
+			if existing := strings.TrimSpace(projects[sessionID]); existing == "" || (project != "" && project < existing) {
+				projects[sessionID] = project
+			}
+		}
+	}
+	return projects
 }
 
 func mutationIdentityKey(mutation store.SyncMutation) string {
