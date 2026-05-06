@@ -307,16 +307,17 @@ type CloudUpgradeRepairReport struct {
 }
 
 type CloudUpgradeLegacyMutationFinding struct {
-	Seq        int64  `json:"seq"`
-	Entity     string `json:"entity"`
-	Op         string `json:"op"`
-	ReasonCode string `json:"reason_code"`
-	Message    string `json:"message"`
-	Repairable bool   `json:"repairable"`
-	RepairHint string `json:"repair_hint,omitempty"`
-	EntityKey  string `json:"entity_key,omitempty"`
-	TargetKey  string `json:"target_key,omitempty"`
-	Project    string `json:"project,omitempty"`
+	Seq           int64    `json:"seq"`
+	Entity        string   `json:"entity"`
+	Op            string   `json:"op"`
+	ReasonCode    string   `json:"reason_code"`
+	Message       string   `json:"message"`
+	Repairable    bool     `json:"repairable"`
+	RepairHint    string   `json:"repair_hint,omitempty"`
+	EntityKey     string   `json:"entity_key,omitempty"`
+	TargetKey     string   `json:"target_key,omitempty"`
+	Project       string   `json:"project"`
+	MissingFields []string `json:"missing_fields,omitempty"`
 }
 
 type CloudUpgradeLegacyMutationReport struct {
@@ -1314,23 +1315,28 @@ func (s *Store) DiagnoseCloudUpgradeLegacyMutations(project string) (CloudUpgrad
 		return CloudUpgradeLegacyMutationReport{}, err
 	}
 	report := CloudUpgradeLegacyMutationReport{Project: project}
+	blockedFindings := make([]CloudUpgradeLegacyMutationFinding, 0)
+	repairableFindings := make([]CloudUpgradeLegacyMutationFinding, 0)
 	for _, eval := range evaluations {
 		if !eval.hasIssue {
 			continue
 		}
 		if eval.canRepair {
+			repairableFindings = append(repairableFindings, eval.finding)
 			report.RepairableCount++
 		} else {
+			blockedFindings = append(blockedFindings, eval.finding)
 			report.BlockedCount++
 		}
-		report.Findings = append(report.Findings, eval.finding)
 	}
+	report.Findings = append(report.Findings, blockedFindings...)
+	report.Findings = append(report.Findings, repairableFindings...)
 	return report, nil
 }
 
 func (s *Store) evaluateCloudUpgradeLegacyMutations(project string) ([]cloudUpgradeLegacyMutationEvaluation, error) {
 	return s.withReadTx(func(tx *sql.Tx) ([]cloudUpgradeLegacyMutationEvaluation, error) {
-		mutations, err := s.listPendingProjectMutationsTx(tx, project)
+		mutations, err := s.listPendingProjectDiagnosisMutationsTx(tx, project)
 		if err != nil {
 			return nil, err
 		}
@@ -1362,6 +1368,20 @@ func (s *Store) listPendingProjectMutationsTx(tx *sql.Tx, project string) ([]Syn
 		WHERE target_key = ? AND project = ? AND acked_at IS NULL
 		ORDER BY seq ASC
 	`, DefaultSyncTargetKey, project)
+	return scanSyncMutationRows(rows, err)
+}
+
+func (s *Store) listPendingProjectDiagnosisMutationsTx(tx *sql.Tx, project string) ([]SyncMutation, error) {
+	rows, err := s.queryItHook(tx, `
+		SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
+		FROM sync_mutations
+		WHERE target_key = ? AND (project = ? OR (project = '' AND entity IN (?, ?))) AND acked_at IS NULL
+		ORDER BY seq ASC
+	`, DefaultSyncTargetKey, project, SyncEntitySession, SyncEntityObservation)
+	return scanSyncMutationRows(rows, err)
+}
+
+func scanSyncMutationRows(rows rowScanner, err error) ([]SyncMutation, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -1382,12 +1402,13 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 	op := strings.TrimSpace(mutation.Op)
 	payload := strings.TrimSpace(mutation.Payload)
 	base := CloudUpgradeLegacyMutationFinding{
-		Seq:       mutation.Seq,
-		Entity:    entity,
-		Op:        op,
-		EntityKey: strings.TrimSpace(mutation.EntityKey),
-		TargetKey: strings.TrimSpace(mutation.TargetKey),
-		Project:   strings.TrimSpace(mutation.Project),
+		Seq:           mutation.Seq,
+		Entity:        entity,
+		Op:            op,
+		EntityKey:     strings.TrimSpace(mutation.EntityKey),
+		TargetKey:     strings.TrimSpace(mutation.TargetKey),
+		Project:       strings.TrimSpace(mutation.Project),
+		MissingFields: ValidateSyncMutationPayloadForProject(entity, op, payload, mutation.EntityKey, mutation.Project).MissingFields,
 	}
 
 	repairable := func(msg, hint string) cloudUpgradeLegacyMutationEvaluation {
@@ -1404,6 +1425,10 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		finding.ReasonCode = code
 		finding.Message = msg
 		return cloudUpgradeLegacyMutationEvaluation{finding: finding, hasIssue: true, canRepair: false}
+	}
+	if base.Project == "" && (entity == SyncEntitySession || entity == SyncEntityObservation) {
+		base.MissingFields = appendMissingField(base.MissingFields, "mutation.project")
+		return blocked(UpgradeReasonBlockedLegacyMutationManual, "projectless legacy mutation requires manual repair before cloud upgrade"), nil
 	}
 
 	if payload == "" {
@@ -1423,6 +1448,7 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("decode session payload: %v", err)), nil
 		}
 		body.ID = strings.TrimSpace(body.ID)
+		body.Project = strings.TrimSpace(body.Project)
 		body.Directory = strings.TrimSpace(body.Directory)
 		changed := false
 		if body.ID == "" && strings.TrimSpace(mutation.EntityKey) != "" {
@@ -1435,17 +1461,36 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.ID {
 			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("session entity_key %q does not match payload id %q", mutation.EntityKey, body.ID)), nil
 		}
-		if op == SyncOpUpsert && body.Directory == "" {
-			var directory string
-			err := tx.QueryRow(`SELECT ifnull(directory, '') FROM sessions WHERE id = ?`, body.ID).Scan(&directory)
-			if errors.Is(err, sql.ErrNoRows) || strings.TrimSpace(directory) == "" {
-				return blocked(UpgradeReasonBlockedLegacyMutationManual, "session payload directory is required and cannot be inferred from local state"), nil
+		if op == SyncOpUpsert {
+			if body.Project == "" {
+				mutationProject := strings.TrimSpace(mutation.Project)
+				localProject, err := s.resolveSessionProjectTx(tx, body.ID)
+				if err != nil {
+					return cloudUpgradeLegacyMutationEvaluation{}, err
+				}
+				if strings.TrimSpace(localProject) == "" {
+					base.MissingFields = appendMissingField(base.MissingFields, "project")
+					return blocked(UpgradeReasonBlockedLegacyMutationManual, "session payload project is required and local session project is absent; mutation project cannot be trusted for repair"), nil
+				}
+				if strings.TrimSpace(localProject) != mutationProject {
+					base.MissingFields = appendMissingField(base.MissingFields, "project")
+					return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("session payload project is required but local session project %q does not match mutation project %q", localProject, mutationProject)), nil
+				}
+				body.Project = mutationProject
+				changed = true
 			}
-			if err != nil {
-				return cloudUpgradeLegacyMutationEvaluation{}, err
+			if body.Directory == "" {
+				var directory string
+				err := tx.QueryRow(`SELECT ifnull(directory, '') FROM sessions WHERE id = ?`, body.ID).Scan(&directory)
+				if errors.Is(err, sql.ErrNoRows) || strings.TrimSpace(directory) == "" {
+					return blocked(UpgradeReasonBlockedLegacyMutationManual, "session payload directory is required and cannot be inferred from local state"), nil
+				}
+				if err != nil {
+					return cloudUpgradeLegacyMutationEvaluation{}, err
+				}
+				body.Directory = strings.TrimSpace(directory)
+				changed = true
 			}
-			body.Directory = strings.TrimSpace(directory)
-			changed = true
 		}
 		if !changed {
 			return cloudUpgradeLegacyMutationEvaluation{}, nil
@@ -1578,6 +1623,19 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 	}
 
 	return cloudUpgradeLegacyMutationEvaluation{}, nil
+}
+
+func appendMissingField(fields []string, field string) []string {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return fields
+	}
+	for _, existing := range fields {
+		if strings.TrimSpace(existing) == field {
+			return fields
+		}
+	}
+	return append(fields, field)
 }
 
 func (s *Store) cloudUpgradeManualActionReport(project string) (bool, CloudUpgradeRepairReport, error) {

@@ -41,6 +41,51 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
+type legacyMutationFixture struct {
+	entity    string
+	entityKey string
+	op        string
+	payload   string
+	project   string
+}
+
+func insertLegacyMutation(t *testing.T, s *Store, fixture legacyMutationFixture) int64 {
+	t.Helper()
+	op := strings.TrimSpace(fixture.op)
+	if op == "" {
+		op = SyncOpUpsert
+	}
+	res, err := s.execHook(s.db,
+		`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		DefaultSyncTargetKey,
+		fixture.entity,
+		fixture.entityKey,
+		op,
+		fixture.payload,
+		SyncSourceLocal,
+		fixture.project,
+	)
+	if err != nil {
+		t.Fatalf("insert legacy %s mutation %q: %v", fixture.entity, fixture.entityKey, err)
+	}
+	seq, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("legacy mutation seq for %q: %v", fixture.entityKey, err)
+	}
+	return seq
+}
+
+func findLegacyFinding(t *testing.T, report CloudUpgradeLegacyMutationReport, entityKey string) CloudUpgradeLegacyMutationFinding {
+	t.Helper()
+	for _, finding := range report.Findings {
+		if finding.EntityKey == entityKey {
+			return finding
+		}
+	}
+	t.Fatalf("expected finding for %q in %+v", entityKey, report.Findings)
+	return CloudUpgradeLegacyMutationFinding{}
+}
+
 type fakeRows struct {
 	next     []bool
 	scanErr  error
@@ -2034,6 +2079,174 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 			t.Fatalf("expected structured blocked and repairable findings, got %+v", report.Findings)
 		}
 	})
+}
+
+func TestDiagnoseCloudUpgradeLegacyMutationsReportsProjectlessBlockersFirst(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("diag-s1", "diag-proj", "/tmp/diag"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := s.EnrollProject("diag-proj"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+
+	repairableSeq := insertLegacyMutation(t, s, legacyMutationFixture{
+		entity:    SyncEntitySession,
+		entityKey: "diag-s1",
+		payload:   `{"id":"diag-s1","project":"diag-proj"}`,
+		project:   "diag-proj",
+	})
+	blockedPayload := `{"sync_id":"projectless-obs","session_id":"diag-s1","type":"decision","scope":"project"}`
+	blockedSeq := insertLegacyMutation(t, s, legacyMutationFixture{
+		entity:    SyncEntityObservation,
+		entityKey: "projectless-obs",
+		payload:   blockedPayload,
+	})
+	insertLegacyMutation(t, s, legacyMutationFixture{entity: SyncEntityPrompt, entityKey: "projectless-prompt", payload: `{}`})
+
+	report, err := s.DiagnoseCloudUpgradeLegacyMutations("diag-proj")
+	if err != nil {
+		t.Fatalf("diagnose legacy mutations: %v", err)
+	}
+	if report.BlockedCount != 1 || report.RepairableCount != 1 || len(report.Findings) != 2 {
+		t.Fatalf("expected one blocked and one repairable finding, got %+v", report)
+	}
+	if report.Findings[0].Seq != blockedSeq || report.Findings[0].Repairable || report.Findings[1].Seq != repairableSeq || !report.Findings[1].Repairable {
+		t.Fatalf("expected blocked finding ordered before repairable finding, got %+v", report.Findings)
+	}
+
+	blocked := findLegacyFinding(t, report, "projectless-obs")
+	if blocked.Project != "" || blocked.Entity != SyncEntityObservation || blocked.TargetKey != DefaultSyncTargetKey {
+		t.Fatalf("unexpected structured projectless finding: %+v", blocked)
+	}
+	if strings.Join(blocked.MissingFields, ",") != "title,content,mutation.project" {
+		t.Fatalf("blocked missing fields = %v", blocked.MissingFields)
+	}
+	encoded, err := json.Marshal(blocked)
+	if err != nil {
+		t.Fatalf("marshal blocked finding: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"project":""`) {
+		t.Fatalf("projectless finding JSON must keep project field, got %s", encoded)
+	}
+
+	repairable := findLegacyFinding(t, report, "diag-s1")
+	if strings.Join(repairable.MissingFields, ",") != "directory" {
+		t.Fatalf("repairable missing fields = %v", repairable.MissingFields)
+	}
+	var afterPayload string
+	if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE seq = ?`, blockedSeq).Scan(&afterPayload); err != nil {
+		t.Fatalf("query projectless payload after diagnosis: %v", err)
+	}
+	if afterPayload != blockedPayload {
+		t.Fatalf("diagnosis mutated projectless payload: before=%s after=%s", blockedPayload, afterPayload)
+	}
+}
+
+func TestDiagnoseCloudUpgradeLegacySessionProjectInferenceSafety(t *testing.T) {
+	tests := []struct {
+		name        string
+		localProj   string
+		mutation    legacyMutationFixture
+		diagnose    string
+		wantRepair  bool
+		wantFields  string
+		wantMessage string
+	}{
+		{
+			name:       "missing payload project is repairable only when local project matches mutation project",
+			localProj:  "session-project",
+			mutation:   legacyMutationFixture{entity: SyncEntitySession, entityKey: "session-missing-project", payload: `{"id":"session-missing-project","directory":"/tmp/session-project"}`, project: "session-project"},
+			diagnose:   "session-project",
+			wantRepair: true,
+			wantFields: "project",
+		},
+		{
+			name:        "stale mutation project is blocked for manual mapping",
+			localProj:   "current-project",
+			mutation:    legacyMutationFixture{entity: SyncEntitySession, entityKey: "session-stale-project", payload: `{"id":"session-stale-project","directory":"/tmp/current-project"}`, project: "stale-project"},
+			diagnose:    "stale-project",
+			wantFields:  "project",
+			wantMessage: `local session project "current-project" does not match mutation project "stale-project"`,
+		},
+		{
+			name:        "projectless mutation is blocked even when local session can infer project",
+			localProj:   "inferable-project",
+			mutation:    legacyMutationFixture{entity: SyncEntitySession, entityKey: "session-projectless", payload: `{"id":"session-projectless","directory":"/tmp/inferable-project"}`},
+			diagnose:    "inferable-project",
+			wantFields:  "project,mutation.project",
+			wantMessage: "projectless legacy mutation",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`, tc.mutation.entityKey, tc.localProj, "/tmp/"+tc.localProj); err != nil {
+				t.Fatalf("insert local session: %v", err)
+			}
+			if err := s.EnrollProject(tc.localProj); err != nil {
+				t.Fatalf("enroll local project: %v", err)
+			}
+			insertLegacyMutation(t, s, tc.mutation)
+
+			report, err := s.DiagnoseCloudUpgradeLegacyMutations(tc.diagnose)
+			if err != nil {
+				t.Fatalf("diagnose session mutation: %v", err)
+			}
+			if len(report.Findings) != 1 {
+				t.Fatalf("expected one finding, got %+v", report)
+			}
+			finding := report.Findings[0]
+			if finding.Repairable != tc.wantRepair {
+				t.Fatalf("repairable=%v, want %v: %+v", finding.Repairable, tc.wantRepair, finding)
+			}
+			if strings.Join(finding.MissingFields, ",") != tc.wantFields {
+				t.Fatalf("missing fields = %v, want %s", finding.MissingFields, tc.wantFields)
+			}
+			if tc.wantMessage != "" && !strings.Contains(finding.Message, tc.wantMessage) {
+				t.Fatalf("expected message containing %q, got %q", tc.wantMessage, finding.Message)
+			}
+		})
+	}
+}
+
+func TestRepairCloudUpgradeBlocksProjectlessLegacyMutationWithoutApplying(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("mixed-repair-s1", "mixed-repair", "/tmp/mixed-repair"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := s.EnrollProject("mixed-repair"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+
+	insertLegacyMutation(t, s, legacyMutationFixture{entity: SyncEntitySession, entityKey: "mixed-repair-s1", payload: `{"id":"mixed-repair-s1","project":"mixed-repair"}`, project: "mixed-repair"})
+	blockedPayload := `{"sync_id":"projectless-repair-obs","session_id":"mixed-repair-s1","type":"decision","scope":"project"}`
+	blockedSeq := insertLegacyMutation(t, s, legacyMutationFixture{entity: SyncEntityObservation, entityKey: "projectless-repair-obs", payload: blockedPayload})
+
+	report, err := s.RepairCloudUpgrade("mixed-repair", true)
+	if err != nil {
+		t.Fatalf("repair mixed legacy mutations: %v", err)
+	}
+	if report.Class != UpgradeRepairClassBlocked || report.Applied {
+		t.Fatalf("expected blocked unapplied report, got %+v", report)
+	}
+	if !strings.Contains(report.Message, fmt.Sprintf("seq=%d", blockedSeq)) || !strings.Contains(report.Message, "entity=observation") {
+		t.Fatalf("expected blocked projectless observation in report message, got %q", report.Message)
+	}
+	if len(report.Findings) != 2 || report.Findings[0].Seq != blockedSeq || report.Findings[0].Repairable || !report.Findings[1].Repairable {
+		t.Fatalf("expected blocked finding before repairable finding, got %+v", report.Findings)
+	}
+	if strings.Join(report.Findings[0].MissingFields, ",") != "title,content,mutation.project" {
+		t.Fatalf("blocked missing fields = %v", report.Findings[0].MissingFields)
+	}
+	var afterPayload string
+	if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE seq = ?`, blockedSeq).Scan(&afterPayload); err != nil {
+		t.Fatalf("query payload after repair: %v", err)
+	}
+	if afterPayload != blockedPayload {
+		t.Fatalf("repair mutated blocked projectless payload: before=%s after=%s", blockedPayload, afterPayload)
+	}
 }
 
 func TestRollbackCloudUpgradeSafetyBoundary(t *testing.T) {
