@@ -1935,6 +1935,115 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 		}
 	})
 
+	t.Run("dry-run plans inferable session directory backfill without mutating", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("directory-source", "directory-repair", "/work/directory-repair"); err != nil {
+			t.Fatalf("create source session: %v", err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, '', datetime('now'))`, "directory-missing", "directory-repair"); err != nil {
+			t.Fatalf("insert legacy session without directory: %v", err)
+		}
+		if err := s.EnrollProject("directory-repair"); err != nil {
+			t.Fatalf("enroll project: %v", err)
+		}
+
+		report, err := s.RepairCloudUpgrade("directory-repair", false)
+		if err != nil {
+			t.Fatalf("dry-run repair: %v", err)
+		}
+		if report.Class != UpgradeRepairClassRepairable || report.Applied {
+			t.Fatalf("expected planned repairable directory backfill, got %+v", report)
+		}
+		if report.PlannedAction != "backfill_session_directories" {
+			t.Fatalf("expected session directory planned action, got %+v", report)
+		}
+		finding := findLegacyFinding(t, CloudUpgradeLegacyMutationReport{Findings: report.Findings}, "directory-missing")
+		if !finding.Repairable || strings.Join(finding.MissingFields, ",") != "directory" || finding.Seq != 0 {
+			t.Fatalf("expected repairable directory finding without mutation payload details, got %+v", finding)
+		}
+		var directory string
+		if err := s.db.QueryRow(`SELECT directory FROM sessions WHERE id = ?`, "directory-missing").Scan(&directory); err != nil {
+			t.Fatalf("query missing directory after dry-run: %v", err)
+		}
+		if directory != "" {
+			t.Fatalf("dry-run mutated session directory: %q", directory)
+		}
+	})
+
+	t.Run("apply backfills inferable session directories without acking or deleting mutations", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("directory-apply-source", "directory-apply", "/work/directory-apply"); err != nil {
+			t.Fatalf("create source session: %v", err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, '', datetime('now'))`, "directory-apply-missing", "directory-apply"); err != nil {
+			t.Fatalf("insert legacy session without directory: %v", err)
+		}
+		if err := s.EnrollProject("directory-apply"); err != nil {
+			t.Fatalf("enroll project: %v", err)
+		}
+		beforeMutations := countSyncMutationRows(t, s, `target_key = ?`, DefaultSyncTargetKey)
+		beforeState, err := s.GetSyncState(DefaultSyncTargetKey)
+		if err != nil {
+			t.Fatalf("get sync state before repair: %v", err)
+		}
+
+		report, err := s.RepairCloudUpgrade("directory-apply", true)
+		if err != nil {
+			t.Fatalf("apply repair: %v", err)
+		}
+		if report.Class != UpgradeRepairClassRepairable || !report.Applied || report.PlannedAction != "backfill_session_directories" {
+			t.Fatalf("expected applied directory backfill, got %+v", report)
+		}
+		var directory string
+		if err := s.db.QueryRow(`SELECT directory FROM sessions WHERE id = ?`, "directory-apply-missing").Scan(&directory); err != nil {
+			t.Fatalf("query applied directory: %v", err)
+		}
+		if directory != "/work/directory-apply" {
+			t.Fatalf("expected inferred directory to be applied, got %q", directory)
+		}
+		afterState, err := s.GetSyncState(DefaultSyncTargetKey)
+		if err != nil {
+			t.Fatalf("get sync state after repair: %v", err)
+		}
+		if afterState.LastAckedSeq != beforeState.LastAckedSeq {
+			t.Fatalf("repair must not edit last_acked_seq: before=%d after=%d", beforeState.LastAckedSeq, afterState.LastAckedSeq)
+		}
+		afterMutations := countSyncMutationRows(t, s, `target_key = ?`, DefaultSyncTargetKey)
+		if afterMutations < beforeMutations {
+			t.Fatalf("repair must not delete mutations: before=%d after=%d", beforeMutations, afterMutations)
+		}
+	})
+
+	t.Run("ambiguous session directory inference remains manual", func(t *testing.T) {
+		s := newTestStore(t)
+		for _, sess := range []struct{ id, dir string }{{"ambiguous-a", "/work/a"}, {"ambiguous-b", "/work/b"}, {"ambiguous-missing", ""}} {
+			if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`, sess.id, "directory-ambiguous", sess.dir); err != nil {
+				t.Fatalf("insert session %s: %v", sess.id, err)
+			}
+		}
+		if err := s.EnrollProject("directory-ambiguous"); err != nil {
+			t.Fatalf("enroll project: %v", err)
+		}
+
+		report, err := s.RepairCloudUpgrade("directory-ambiguous", true)
+		if err != nil {
+			t.Fatalf("repair ambiguous directory: %v", err)
+		}
+		if report.Class != UpgradeRepairClassBlocked || report.Applied {
+			t.Fatalf("expected blocked manual directory repair, got %+v", report)
+		}
+		if len(report.Findings) != 1 || report.Findings[0].Repairable || !strings.Contains(report.Findings[0].Message, "cannot be inferred safely") {
+			t.Fatalf("expected non-repairable directory finding, got %+v", report.Findings)
+		}
+		var directory string
+		if err := s.db.QueryRow(`SELECT directory FROM sessions WHERE id = ?`, "ambiguous-missing").Scan(&directory); err != nil {
+			t.Fatalf("query ambiguous directory after repair: %v", err)
+		}
+		if directory != "" {
+			t.Fatalf("ambiguous repair guessed directory %q", directory)
+		}
+	})
+
 	t.Run("blocked ambiguity is not auto-mutated", func(t *testing.T) {
 		s := newTestStore(t)
 		report, err := s.RepairCloudUpgrade("unregistered-proj", true)
@@ -4834,7 +4943,7 @@ func TestBackfillValidatesGeneratedSyncPayloads(t *testing.T) {
 		assertNoBackfillMutation(t, s, "bad-session")
 	})
 
-	t.Run("partial session does not repeat as repairable backfill gap", func(t *testing.T) {
+	t.Run("partial session without inferable directory is manual during upgrade repair", func(t *testing.T) {
 		s := newTestStore(t)
 		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`, "partial-noop-session", "partial-noop", ""); err != nil {
 			t.Fatalf("insert partial session: %v", err)
@@ -4847,8 +4956,8 @@ func TestBackfillValidatesGeneratedSyncPayloads(t *testing.T) {
 		if err != nil {
 			t.Fatalf("repair dry run for partial session: %v", err)
 		}
-		if report.Class != UpgradeRepairClassReady || report.ReasonCode != "upgrade_repair_noop" {
-			t.Fatalf("expected partial skipped session not to report repairable backfill gap, got %+v", report)
+		if report.Class != UpgradeRepairClassBlocked || report.ReasonCode != UpgradeReasonBlockedSessionDirectoryManual || report.Applied {
+			t.Fatalf("expected partial skipped session to require manual directory repair, got %+v", report)
 		}
 		assertNoBackfillMutation(t, s, "partial-noop-session")
 	})

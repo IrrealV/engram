@@ -331,6 +331,8 @@ type CloudUpgradeLegacyMutationReport struct {
 const (
 	UpgradeReasonRepairableLegacyMutationPayload = "upgrade_repairable_legacy_mutation_payload"
 	UpgradeReasonBlockedLegacyMutationManual     = "upgrade_blocked_legacy_mutation_manual"
+	UpgradeReasonRepairableSessionDirectory      = "upgrade_repairable_session_directory"
+	UpgradeReasonBlockedSessionDirectoryManual   = "upgrade_blocked_session_directory_manual"
 )
 
 // EnrolledProject represents a project enrolled for cloud sync.
@@ -1223,6 +1225,48 @@ func (s *Store) RepairCloudUpgrade(project string, apply bool) (CloudUpgradeRepa
 		}, nil
 	}
 
+	directoryDiagnosis, err := s.diagnoseSessionDirectoryBackfill(project)
+	if err != nil {
+		return CloudUpgradeRepairReport{}, fmt.Errorf("diagnose session directory repair: %w", err)
+	}
+	if directoryDiagnosis.blocked {
+		return CloudUpgradeRepairReport{
+			Class:      UpgradeRepairClassBlocked,
+			ReasonCode: UpgradeReasonBlockedSessionDirectoryManual,
+			Message:    fmt.Sprintf("manual-action-required: %d legacy session directory value(s) cannot be inferred safely for project %q", len(directoryDiagnosis.missingIDs), project),
+			Applied:    false,
+			Findings:   directoryDiagnosis.findings,
+		}, nil
+	}
+	if len(directoryDiagnosis.missingIDs) > 0 {
+		report := CloudUpgradeRepairReport{
+			Class:         UpgradeRepairClassRepairable,
+			ReasonCode:    UpgradeReasonRepairableSessionDirectory,
+			Message:       fmt.Sprintf("project %q has %d legacy session directory value(s) that can be inferred locally", project, len(directoryDiagnosis.missingIDs)),
+			PlannedAction: "backfill_session_directories",
+			Applied:       false,
+			Findings:      directoryDiagnosis.findings,
+		}
+		if !apply {
+			return report, nil
+		}
+		if err := s.withTx(func(tx *sql.Tx) error {
+			if err := s.backfillSessionDirectoriesTx(tx, project, directoryDiagnosis.inferredDirectory); err != nil {
+				return err
+			}
+			return s.backfillProjectSyncMutationsTx(tx, project)
+		}); err != nil {
+			return CloudUpgradeRepairReport{}, fmt.Errorf("apply cloud upgrade session directory repair: %w", err)
+		}
+		report.Applied = true
+		_ = s.SaveCloudUpgradeState(CloudUpgradeState{
+			Project:     project,
+			Stage:       UpgradeStageRepairApplied,
+			RepairClass: UpgradeRepairClassRepairable,
+		})
+		return report, nil
+	}
+
 	legacyReport, err := s.DiagnoseCloudUpgradeLegacyMutations(project)
 	if err != nil {
 		return CloudUpgradeRepairReport{}, fmt.Errorf("diagnose legacy cloud upgrade mutations: %w", err)
@@ -1304,6 +1348,13 @@ type cloudUpgradeLegacyMutationEvaluation struct {
 	canRepair bool
 }
 
+type cloudUpgradeSessionDirectoryDiagnosis struct {
+	missingIDs        []string
+	inferredDirectory string
+	findings          []CloudUpgradeLegacyMutationFinding
+	blocked           bool
+}
+
 func (s *Store) DiagnoseCloudUpgradeLegacyMutations(project string) (CloudUpgradeLegacyMutationReport, error) {
 	project, _ = NormalizeProject(project)
 	project = strings.TrimSpace(project)
@@ -1333,6 +1384,107 @@ func (s *Store) DiagnoseCloudUpgradeLegacyMutations(project string) (CloudUpgrad
 	report.Findings = append(report.Findings, blockedFindings...)
 	report.Findings = append(report.Findings, repairableFindings...)
 	return report, nil
+}
+
+func (s *Store) diagnoseSessionDirectoryBackfill(project string) (cloudUpgradeSessionDirectoryDiagnosis, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return cloudUpgradeSessionDirectoryDiagnosis{}, nil
+	}
+
+	rows, err := s.queryItHook(s.db, `
+		SELECT id
+		FROM sessions
+		WHERE project = ? AND trim(ifnull(directory, '')) = ''
+		ORDER BY id ASC
+	`, project)
+	if err != nil {
+		return cloudUpgradeSessionDirectoryDiagnosis{}, err
+	}
+	missingIDs := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return cloudUpgradeSessionDirectoryDiagnosis{}, closeRowsWithError(rows, err)
+		}
+		missingIDs = append(missingIDs, strings.TrimSpace(id))
+	}
+	if err := rows.Close(); err != nil {
+		return cloudUpgradeSessionDirectoryDiagnosis{}, err
+	}
+	if err := rows.Err(); err != nil {
+		return cloudUpgradeSessionDirectoryDiagnosis{}, err
+	}
+	if len(missingIDs) == 0 {
+		return cloudUpgradeSessionDirectoryDiagnosis{}, nil
+	}
+
+	directoryRows, err := s.queryItHook(s.db, `
+		SELECT DISTINCT trim(directory)
+		FROM sessions
+		WHERE project = ? AND trim(ifnull(directory, '')) <> ''
+		ORDER BY trim(directory) ASC
+	`, project)
+	if err != nil {
+		return cloudUpgradeSessionDirectoryDiagnosis{}, err
+	}
+	directories := make([]string, 0, 2)
+	for directoryRows.Next() {
+		var directory string
+		if err := directoryRows.Scan(&directory); err != nil {
+			return cloudUpgradeSessionDirectoryDiagnosis{}, closeRowsWithError(directoryRows, err)
+		}
+		directories = append(directories, strings.TrimSpace(directory))
+	}
+	if err := directoryRows.Close(); err != nil {
+		return cloudUpgradeSessionDirectoryDiagnosis{}, err
+	}
+	if err := directoryRows.Err(); err != nil {
+		return cloudUpgradeSessionDirectoryDiagnosis{}, err
+	}
+
+	diagnosis := cloudUpgradeSessionDirectoryDiagnosis{missingIDs: missingIDs}
+	if len(directories) == 1 {
+		diagnosis.inferredDirectory = directories[0]
+	}
+	diagnosis.blocked = diagnosis.inferredDirectory == ""
+	diagnosis.findings = make([]CloudUpgradeLegacyMutationFinding, 0, len(missingIDs))
+	for _, id := range missingIDs {
+		finding := CloudUpgradeLegacyMutationFinding{
+			Entity:        SyncEntitySession,
+			Op:            SyncOpUpsert,
+			EntityKey:     id,
+			TargetKey:     DefaultSyncTargetKey,
+			Project:       project,
+			MissingFields: []string{"directory"},
+			Repairable:    !diagnosis.blocked,
+		}
+		if diagnosis.blocked {
+			finding.ReasonCode = UpgradeReasonBlockedSessionDirectoryManual
+			finding.Message = "session directory is required and cannot be inferred safely from a single project directory"
+		} else {
+			finding.ReasonCode = UpgradeReasonRepairableSessionDirectory
+			finding.Message = "session directory can be inferred from the selected project's existing local session directory"
+			finding.RepairHint = "repair backfills sessions.directory locally before sync journal backfill"
+		}
+		diagnosis.findings = append(diagnosis.findings, finding)
+	}
+	return diagnosis, nil
+}
+
+func (s *Store) backfillSessionDirectoriesTx(tx *sql.Tx, project, directory string) error {
+	project = strings.TrimSpace(project)
+	directory = strings.TrimSpace(directory)
+	if project == "" || directory == "" {
+		return nil
+	}
+	_, err := s.execHook(tx, `
+		UPDATE sessions
+		SET directory = ?
+		WHERE project = ? AND trim(ifnull(directory, '')) = ''
+	`, directory, project)
+	return err
 }
 
 func (s *Store) evaluateCloudUpgradeLegacyMutations(project string) ([]cloudUpgradeLegacyMutationEvaluation, error) {
