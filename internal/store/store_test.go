@@ -2398,6 +2398,87 @@ func TestDiagnoseCloudUpgradeLegacySessionProjectInferenceSafety(t *testing.T) {
 	}
 }
 
+func TestRepairCloudUpgradeReportsRenamedProjectMutationsAsManual(t *testing.T) {
+	tests := []struct {
+		name      string
+		entity    string
+		entityKey string
+		payload   string
+	}{
+		{
+			name:      "session mutation belongs to local selected project under stale project name",
+			entity:    SyncEntitySession,
+			entityKey: "renamed-session",
+			payload:   `{"id":"renamed-session","project":"old-project","directory":"/work/current-project"}`,
+		},
+		{
+			name:      "observation mutation belongs to local selected project under stale project name",
+			entity:    SyncEntityObservation,
+			entityKey: "renamed-observation",
+			payload:   `{"sync_id":"renamed-observation","session_id":"renamed-session","type":"decision","title":"legacy","content":"payload","project":"old-project","scope":"project"}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSession("renamed-session", "current-project", "/work/current-project"); err != nil {
+				t.Fatalf("create local session: %v", err)
+			}
+			if _, err := s.AddObservation(AddObservationParams{SessionID: "renamed-session", Type: "decision", Title: "Current", Content: "Local", Project: "current-project", Scope: "project"}); err != nil {
+				t.Fatalf("add local observation: %v", err)
+			}
+			if tc.entity == SyncEntityObservation {
+				if _, err := s.db.Exec(`UPDATE observations SET sync_id = ? WHERE session_id = ?`, tc.entityKey, "renamed-session"); err != nil {
+					t.Fatalf("seed observation sync id: %v", err)
+				}
+			}
+			if err := s.EnrollProject("current-project"); err != nil {
+				t.Fatalf("enroll current project: %v", err)
+			}
+
+			seq := insertLegacyMutation(t, s, legacyMutationFixture{entity: tc.entity, entityKey: tc.entityKey, payload: tc.payload, project: "old-project"})
+			beforeState, err := s.GetSyncState(DefaultSyncTargetKey)
+			if err != nil {
+				t.Fatalf("get sync state before repair: %v", err)
+			}
+
+			report, err := s.RepairCloudUpgrade("current-project", true)
+			if err != nil {
+				t.Fatalf("repair renamed project mutation: %v", err)
+			}
+			if report.Class != UpgradeRepairClassBlocked || report.Applied {
+				t.Fatalf("expected blocked manual renamed-project repair, got %+v", report)
+			}
+			if len(report.Findings) != 1 {
+				t.Fatalf("expected one renamed-project finding, got %+v", report.Findings)
+			}
+			finding := report.Findings[0]
+			if finding.Seq != seq || finding.Repairable || finding.Project != "old-project" || finding.EntityKey != tc.entityKey {
+				t.Fatalf("unexpected renamed-project finding: %+v", finding)
+			}
+			if !strings.Contains(finding.Message, "manual project rename or alias mapping") || !strings.Contains(finding.RepairHint, "rerun repair for the correct project") {
+				t.Fatalf("expected concise manual guidance, got message=%q hint=%q", finding.Message, finding.RepairHint)
+			}
+
+			var afterPayload string
+			if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE seq = ?`, seq).Scan(&afterPayload); err != nil {
+				t.Fatalf("query payload after repair: %v", err)
+			}
+			if afterPayload != tc.payload {
+				t.Fatalf("repair mutated renamed-project payload: before=%s after=%s", tc.payload, afterPayload)
+			}
+			afterState, err := s.GetSyncState(DefaultSyncTargetKey)
+			if err != nil {
+				t.Fatalf("get sync state after repair: %v", err)
+			}
+			if afterState.LastAckedSeq != beforeState.LastAckedSeq {
+				t.Fatalf("repair must not edit last_acked_seq: before=%d after=%d", beforeState.LastAckedSeq, afterState.LastAckedSeq)
+			}
+		})
+	}
+}
+
 func TestRepairCloudUpgradeBlocksProjectlessLegacyMutationWithoutApplying(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("mixed-repair-s1", "mixed-repair", "/tmp/mixed-repair"); err != nil {

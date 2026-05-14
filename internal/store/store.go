@@ -1510,7 +1510,7 @@ func (s *Store) evaluateCloudUpgradeLegacyMutations(project string) ([]cloudUpgr
 		}
 		evaluations := make([]cloudUpgradeLegacyMutationEvaluation, 0, len(mutations))
 		for _, mutation := range mutations {
-			eval, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, mutation)
+			eval, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, project, mutation)
 			if err != nil {
 				return nil, err
 			}
@@ -1543,9 +1543,20 @@ func (s *Store) listPendingProjectDiagnosisMutationsTx(tx *sql.Tx, project strin
 	rows, err := s.queryItHook(tx, `
 		SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
 		FROM sync_mutations
-		WHERE target_key = ? AND (project = ? OR (project = '' AND entity IN (?, ?))) AND acked_at IS NULL
+		WHERE target_key = ? AND acked_at IS NULL AND (
+			project = ?
+			OR (project = '' AND entity IN (?, ?))
+			OR (
+				trim(ifnull(project, '')) <> ''
+				AND project <> ?
+				AND (
+					(entity = ? AND EXISTS (SELECT 1 FROM sessions WHERE sessions.id = sync_mutations.entity_key AND sessions.project = ?))
+					OR (entity = ? AND EXISTS (SELECT 1 FROM observations WHERE observations.sync_id = sync_mutations.entity_key AND observations.project = ?))
+				)
+			)
+		)
 		ORDER BY seq ASC
-	`, DefaultSyncTargetKey, project, SyncEntitySession, SyncEntityObservation)
+	`, DefaultSyncTargetKey, project, SyncEntitySession, SyncEntityObservation, project, SyncEntitySession, project, SyncEntityObservation, project)
 	return scanSyncMutationRows(rows, err)
 }
 
@@ -1565,7 +1576,8 @@ func scanSyncMutationRows(rows rowScanner, err error) ([]SyncMutation, error) {
 	return mutations, rows.Err()
 }
 
-func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMutation) (cloudUpgradeLegacyMutationEvaluation, error) {
+func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, selectedProject string, mutation SyncMutation) (cloudUpgradeLegacyMutationEvaluation, error) {
+	selectedProject = strings.TrimSpace(selectedProject)
 	entity := strings.TrimSpace(mutation.Entity)
 	op := strings.TrimSpace(mutation.Op)
 	payload := strings.TrimSpace(mutation.Payload)
@@ -1592,6 +1604,15 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		finding.Repairable = false
 		finding.ReasonCode = code
 		finding.Message = msg
+		return cloudUpgradeLegacyMutationEvaluation{finding: finding, hasIssue: true, canRepair: false}
+	}
+	blockedProjectMapping := func() cloudUpgradeLegacyMutationEvaluation {
+		finding := base
+		finding.Repairable = false
+		finding.ReasonCode = UpgradeReasonBlockedLegacyMutationManual
+		finding.Message = fmt.Sprintf("legacy mutation project %q does not match selected project %q; manual project rename or alias mapping is required", base.Project, selectedProject)
+		finding.RepairHint = "rerun repair for the correct project, inspect local project mapping, or recreate the legacy mutation after choosing the correct project"
+		finding.MissingFields = appendMissingField(finding.MissingFields, "project_mapping")
 		return cloudUpgradeLegacyMutationEvaluation{finding: finding, hasIssue: true, canRepair: false}
 	}
 	if base.Project == "" && (entity == SyncEntitySession || entity == SyncEntityObservation) {
@@ -1628,6 +1649,15 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		}
 		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.ID {
 			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("session entity_key %q does not match payload id %q", mutation.EntityKey, body.ID)), nil
+		}
+		if selectedProject != "" && base.Project != "" && base.Project != selectedProject {
+			localProject, err := s.resolveSessionProjectTx(tx, body.ID)
+			if err != nil {
+				return cloudUpgradeLegacyMutationEvaluation{}, err
+			}
+			if strings.TrimSpace(localProject) == selectedProject {
+				return blockedProjectMapping(), nil
+			}
 		}
 		if op == SyncOpUpsert {
 			if body.Project == "" {
@@ -1690,6 +1720,15 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		}
 		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.SyncID {
 			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("observation entity_key %q does not match payload sync_id %q", mutation.EntityKey, body.SyncID)), nil
+		}
+		if selectedProject != "" && base.Project != "" && base.Project != selectedProject {
+			obs, err := s.getObservationBySyncIDTx(tx, body.SyncID, true)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return cloudUpgradeLegacyMutationEvaluation{}, err
+			}
+			if obs != nil && obs.Project != nil && strings.TrimSpace(*obs.Project) == selectedProject {
+				return blockedProjectMapping(), nil
+			}
 		}
 		if op == SyncOpUpsert {
 			obs, err := s.getObservationBySyncIDTx(tx, body.SyncID, true)
@@ -1819,7 +1858,7 @@ func (s *Store) repairCloudUpgradeLegacyMutationPayloadsTx(tx *sql.Tx, project s
 		return err
 	}
 	for _, mutation := range mutations {
-		eval, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, mutation)
+		eval, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, project, mutation)
 		if err != nil {
 			return err
 		}
