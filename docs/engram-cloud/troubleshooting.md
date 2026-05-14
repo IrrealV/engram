@@ -93,9 +93,10 @@ log() {
 run_step() {
   if "$@" >>"$log_file" 2>&1; then
     return 0
+  else
+    step_rc=$?
   fi
 
-  step_rc=$?
   log "FAIL step rc=$step_rc command=$*"
   cp "$log_file" "$last_failure_file"
   return "$step_rc"
