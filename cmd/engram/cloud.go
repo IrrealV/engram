@@ -415,8 +415,54 @@ func cmdCloudUpgradeRepair(cfg store.Config) {
 	if strings.TrimSpace(report.PlannedAction) != "" {
 		fmt.Printf("planned_action: %s\n", report.PlannedAction)
 	}
+	printCloudUpgradeRepairSummary(project, dryRun, report)
 	fmt.Printf("applied: %t\n", report.Applied)
 	printCloudUpgradeRepairFindings(report.Findings)
+}
+
+func printCloudUpgradeRepairSummary(project string, dryRun bool, report store.CloudUpgradeRepairReport) {
+	plannedRepairs := 0
+	manualBlockers := 0
+	for _, finding := range report.Findings {
+		if finding.Repairable {
+			plannedRepairs++
+		} else {
+			manualBlockers++
+		}
+	}
+	if report.Class == store.UpgradeRepairClassRepairable && strings.TrimSpace(report.PlannedAction) != "" {
+		if plannedRepairs == 0 {
+			plannedRepairs = 1
+		}
+	}
+	appliedRepairs := 0
+	if report.Applied {
+		appliedRepairs = plannedRepairs
+		if appliedRepairs == 0 {
+			appliedRepairs = 1
+		}
+	}
+	if manualBlockers == 0 && report.Class != store.UpgradeRepairClassReady && report.Class != store.UpgradeRepairClassRepairable {
+		manualBlockers = 1
+	}
+
+	fmt.Printf("planned_repairs: %d\n", plannedRepairs)
+	fmt.Printf("applied_repairs: %d\n", appliedRepairs)
+	fmt.Printf("manual_blockers: %d\n", manualBlockers)
+	fmt.Printf("next_step: %s\n", cloudUpgradeRepairNextStep(project, dryRun, plannedRepairs, appliedRepairs, manualBlockers))
+}
+
+func cloudUpgradeRepairNextStep(project string, dryRun bool, plannedRepairs, appliedRepairs, manualBlockers int) string {
+	if manualBlockers > 0 {
+		return "resolve manual blockers before cloud push"
+	}
+	if dryRun && plannedRepairs > 0 {
+		return fmt.Sprintf("review dry-run, then run `engram cloud upgrade repair --project %s --apply`", project)
+	}
+	if !dryRun && appliedRepairs > 0 {
+		return fmt.Sprintf("run `engram cloud upgrade bootstrap --project %s`", project)
+	}
+	return fmt.Sprintf("run `engram cloud upgrade bootstrap --project %s` when ready", project)
 }
 
 func printCloudUpgradeRepairFindings(findings []store.CloudUpgradeLegacyMutationFinding) {
@@ -434,6 +480,11 @@ func printCloudUpgradeRepairFindings(findings []store.CloudUpgradeLegacyMutation
 		fmt.Printf("%s.seq: %d\n", prefix, finding.Seq)
 		fmt.Printf("%s.entity: %s\n", prefix, finding.Entity)
 		fmt.Printf("%s.op: %s\n", prefix, finding.Op)
+		fmt.Printf("%s.reason_code: %s\n", prefix, finding.ReasonCode)
+		fmt.Printf("%s.message: %s\n", prefix, finding.Message)
+		if strings.TrimSpace(finding.RepairHint) != "" {
+			fmt.Printf("%s.repair_hint: %s\n", prefix, finding.RepairHint)
+		}
 		fmt.Printf("%s.repairable: %t\n", prefix, finding.Repairable)
 		fmt.Printf("%s.project: %s\n", prefix, finding.Project)
 		fmt.Printf("%s.entity_key: %s\n", prefix, finding.EntityKey)

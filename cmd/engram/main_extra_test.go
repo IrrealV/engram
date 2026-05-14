@@ -1139,13 +1139,20 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 			"mode: dry-run",
 			"dry_run: true",
 			"local_only: true",
+			"planned_repairs: 1",
+			"applied_repairs: 0",
+			"manual_blockers: 0",
 			"applied: false",
+			"next_step: review dry-run, then run `engram cloud upgrade repair --project proj-a --apply`",
 			"findings_total: 1",
 			"findings_repairable: 1",
 			"findings_blocked: 0",
 			"finding[0].seq:",
 			"finding[0].entity: observation",
 			"finding[0].op: upsert",
+			"finding[0].reason_code: upgrade_repairable_legacy_mutation_payload",
+			"finding[0].message: observation payload is missing required fields for canonical bootstrap",
+			"finding[0].repair_hint: repair fills missing observation fields from local observations table",
 			"finding[0].repairable: true",
 			"finding[0].project: proj-a",
 			"finding[0].entity_key:",
@@ -1187,13 +1194,76 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 			"mode: apply",
 			"dry_run: false",
 			"local_only: true",
+			"planned_repairs: 1",
+			"applied_repairs: 1",
+			"manual_blockers: 0",
 			"applied: true",
 			"planned_action: repair_legacy_mutation_payloads",
+			"next_step: run `engram cloud upgrade bootstrap --project proj-a`",
 			"findings_total: 1",
 		} {
 			if !strings.Contains(stdout, want) {
 				t.Fatalf("expected apply output to include %q, got %q", want, stdout)
 			}
+		}
+	})
+
+	t.Run("repair blocked output gives manual guidance and no payload content", func(t *testing.T) {
+		cfg := testConfig(t)
+		s, err := store.New(cfg)
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		if err := s.CreateSession("manual-s1", "proj-a", "/tmp/proj-a"); err != nil {
+			_ = s.Close()
+			t.Fatalf("create session: %v", err)
+		}
+		if err := s.EnrollProject("proj-a"); err != nil {
+			_ = s.Close()
+			t.Fatalf("enroll project: %v", err)
+		}
+		_ = s.Close()
+
+		db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+		if err != nil {
+			t.Fatalf("open raw db: %v", err)
+		}
+		defer db.Close()
+		legacyPayload := `{"sync_id":"manual-obs","session_id":"missing-manual-session","type":"decision","scope":"project","content":"sensitive legacy body"}`
+		if _, err := db.Exec(
+			`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			store.DefaultSyncTargetKey,
+			store.SyncEntityObservation,
+			"manual-obs",
+			store.SyncOpUpsert,
+			legacyPayload,
+			store.SyncSourceLocal,
+			"",
+		); err != nil {
+			t.Fatalf("insert projectless mutation: %v", err)
+		}
+
+		withArgs(t, "engram", "cloud", "upgrade", "repair", "--project", "proj-a", "--apply")
+		stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+		if recovered != nil || stderr != "" {
+			t.Fatalf("repair blocked report should succeed, panic=%v stderr=%q", recovered, stderr)
+		}
+		for _, want := range []string{
+			"mode: apply",
+			"planned_repairs: 0",
+			"applied_repairs: 0",
+			"manual_blockers: 1",
+			"applied: false",
+			"next_step: resolve manual blockers before cloud push",
+			"finding[0].reason_code: upgrade_blocked_legacy_mutation_manual",
+			"finding[0].message: projectless legacy mutation requires manual repair before cloud upgrade",
+		} {
+			if !strings.Contains(stdout, want) {
+				t.Fatalf("expected blocked repair output to include %q, got %q", want, stdout)
+			}
+		}
+		if strings.Contains(stdout, "sensitive legacy body") || strings.Contains(stdout, legacyPayload) {
+			t.Fatalf("blocked repair output must not dump payload content, got %q", stdout)
 		}
 	})
 
