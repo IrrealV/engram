@@ -53,6 +53,175 @@ The local `~/.engram/cloud.json` stores the server URL. The token is intentional
 
 ---
 
+## Scheduled Wrapper Logs
+
+When a scheduler runs explicit cloud sync, the wrapper must make failures durable. A good wrapper:
+
+- appends stdout and stderr to a log file that survives the scheduler process;
+- writes `START`, `OK`, and `FAIL` lines for each project;
+- keeps syncing remaining projects after one failure, then exits non-zero if any project push, import, status, or sync step failed;
+- never hides failures with `/dev/null`, `|| true`, broad `SilentlyContinue`, or unconditional `exit 0` / `Exit 0`.
+
+The examples below use documented cloud sync commands:
+
+```bash
+engram sync --cloud --import --project <project>
+engram sync --cloud --project <project>
+engram sync --cloud --status --project <project>
+```
+
+### Bash / WSL example
+
+Store this as your own wrapper, for example `~/bin/engram-cloud-sync.sh`, and schedule that file from cron or systemd.
+
+```bash
+#!/usr/bin/env bash
+set -u
+
+projects=("my-project" "another-project")
+log_dir="${ENGRAM_SYNC_LOG_DIR:-$HOME/.engram/logs}"
+log_file="$log_dir/cloud-sync.log"
+last_failure_file="$log_dir/cloud-sync.last-failure.log"
+
+mkdir -p "$log_dir"
+overall_rc=0
+
+log() {
+  printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$log_file"
+}
+
+run_step() {
+  if "$@" >>"$log_file" 2>&1; then
+    return 0
+  fi
+
+  step_rc=$?
+  log "FAIL step rc=$step_rc command=$*"
+  cp "$log_file" "$last_failure_file"
+  return "$step_rc"
+}
+
+for project in "${projects[@]}"; do
+  log "START project=$project"
+
+  if run_step engram sync --cloud --import --project "$project" && \
+     run_step engram sync --cloud --project "$project" && \
+     run_step engram sync --cloud --status --project "$project"; then
+    log "OK project=$project"
+  else
+    project_rc=$?
+    overall_rc=1
+    log "FAIL project=$project rc=$project_rc"
+  fi
+done
+
+if [ "$overall_rc" -ne 0 ]; then
+  log "FAIL scheduled cloud sync completed with errors"
+else
+  log "OK scheduled cloud sync completed"
+fi
+
+exit "$overall_rc"
+```
+
+Default log location:
+
+```bash
+~/.engram/logs/cloud-sync.log
+~/.engram/logs/cloud-sync.last-failure.log
+```
+
+Inspect the most recent run and the last failed run:
+
+```bash
+less ~/.engram/logs/cloud-sync.log
+less ~/.engram/logs/cloud-sync.last-failure.log
+```
+
+### PowerShell example
+
+Store this as your own wrapper, for example `%USERPROFILE%\bin\engram-cloud-sync.ps1`, and schedule it from Windows Task Scheduler.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+
+$Projects = @('my-project', 'another-project')
+$LogDir = if ($env:ENGRAM_SYNC_LOG_DIR) { $env:ENGRAM_SYNC_LOG_DIR } else { Join-Path $HOME '.engram\logs' }
+$LogFile = Join-Path $LogDir 'cloud-sync.log'
+$LastFailureFile = Join-Path $LogDir 'cloud-sync.last-failure.log'
+
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$OverallExitCode = 0
+
+function Write-SyncLog {
+    param([string] $Message)
+    $Line = "{0:o} {1}" -f (Get-Date), $Message
+    Add-Content -Path $LogFile -Value $Line
+    Write-Host $Line
+}
+
+function Invoke-LoggedNative {
+    param([string[]] $Arguments)
+
+    & engram @Arguments >> $LogFile 2>&1
+    $ExitCode = $LASTEXITCODE
+    if ($ExitCode -ne 0) {
+        Write-SyncLog "FAIL step rc=$ExitCode command=engram $($Arguments -join ' ')"
+        Copy-Item -Force $LogFile $LastFailureFile
+    }
+
+    return $ExitCode
+}
+
+foreach ($Project in $Projects) {
+    Write-SyncLog "START project=$Project"
+
+    $ImportExit = Invoke-LoggedNative @('sync', '--cloud', '--import', '--project', $Project)
+    if ($ImportExit -eq 0) {
+        $SyncExit = Invoke-LoggedNative @('sync', '--cloud', '--project', $Project)
+    } else {
+        $SyncExit = 0
+    }
+
+    if ($ImportExit -eq 0 -and $SyncExit -eq 0) {
+        $StatusExit = Invoke-LoggedNative @('sync', '--cloud', '--status', '--project', $Project)
+    } else {
+        $StatusExit = 0
+    }
+
+    if ($ImportExit -eq 0 -and $SyncExit -eq 0 -and $StatusExit -eq 0) {
+        Write-SyncLog "OK project=$Project"
+    } else {
+        $OverallExitCode = 1
+        Write-SyncLog "FAIL project=$Project import_rc=$ImportExit sync_rc=$SyncExit status_rc=$StatusExit"
+    }
+}
+
+if ($OverallExitCode -ne 0) {
+    Write-SyncLog 'FAIL scheduled cloud sync completed with errors'
+} else {
+    Write-SyncLog 'OK scheduled cloud sync completed'
+}
+
+Exit $OverallExitCode
+```
+
+Default log location:
+
+```powershell
+$HOME\.engram\logs\cloud-sync.log
+$HOME\.engram\logs\cloud-sync.last-failure.log
+```
+
+Inspect the most recent run and the last failed run:
+
+```powershell
+Get-Content -Tail 200 $HOME\.engram\logs\cloud-sync.log
+Get-Content -Tail 200 $HOME\.engram\logs\cloud-sync.last-failure.log
+```
+
+---
+
 ## Error: `chunk_id does not match payload content hash`
 
 This error means the legacy chunk upload endpoint rejected a payload because the client-provided `chunk_id` did not match the server-computed canonical hash.

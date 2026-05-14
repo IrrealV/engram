@@ -1210,6 +1210,12 @@ For a step-by-step recovery guide covering `chunk_id does not match payload cont
 
 **Local writes still blocked**: Autosync runs in its own goroutine and never holds locks shared with the local write path. If local writes appear blocked, investigate the SQLite store layer, not the autosync manager.
 
+### Scheduled wrapper logging
+
+If you wrap explicit cloud sync in cron, systemd timers, Task Scheduler, or another scheduler, make the wrapper fail visible: preserve stdout/stderr in durable logs, log each project start/end/failure, and exit non-zero when any project fails. Do not redirect scheduled sync to `/dev/null`, append `|| true`, use broad PowerShell `SilentlyContinue`, or end with an unconditional success exit.
+
+See [Engram Cloud Troubleshooting — Scheduled wrapper logs](docs/engram-cloud/troubleshooting.md#scheduled-wrapper-logs) for Bash/WSL and PowerShell examples, log locations, and last-failure inspection commands.
+
 ---
 
 ---

@@ -86,6 +86,7 @@ For a direct registry-based deploy example, use:
 | [Branding](./branding.md) | Engram Cloud visual identity, asset usage, previews |
 | [Technical Cloud Reference](../../DOCS.md#cloud-cli-opt-in) | Full CLI + env/runtime details |
 | [Cloud Autosync](../../DOCS.md#cloud-autosync) | Background replication behavior + phase table |
+| [Scheduled Wrapper Logs](./troubleshooting.md#scheduled-wrapper-logs) | Fail-visible Bash/WSL and PowerShell wrapper examples |
 
 ---
 

@@ -231,5 +231,6 @@ Rules that matter:
 
 - Deep runtime/env reference: [DOCS.md — Cloud CLI](../../DOCS.md#cloud-cli-opt-in)
 - Background sync mode: [DOCS.md — Cloud Autosync](../../DOCS.md#cloud-autosync)
+- Scheduled sync wrappers: [Troubleshooting — Scheduled wrapper logs](./troubleshooting.md#scheduled-wrapper-logs)
 - Cloud sync failures: [Troubleshooting](./troubleshooting.md)
 - Branding assets and usage: [Branding](./branding.md)

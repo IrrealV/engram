@@ -174,6 +174,7 @@ For authenticated mode, upgrade flow, dashboard behavior, reason codes, and full
 - [Engram Cloud quickstart](docs/engram-cloud/quickstart.md)
 - [DOCS.md — Cloud CLI reference](DOCS.md#cloud-cli-opt-in)
 - [DOCS.md — Cloud Autosync](DOCS.md#cloud-autosync)
+- [Troubleshooting — scheduled wrapper logs](docs/engram-cloud/troubleshooting.md#scheduled-wrapper-logs)
 
 ## Steps to Test (Beta — Phases 2+3+4)
 
