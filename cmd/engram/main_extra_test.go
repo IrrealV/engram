@@ -1174,7 +1174,7 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("repair apply output is explicit when legacy payload apply is deferred", func(t *testing.T) {
+	t.Run("repair apply output is explicit when legacy payload repair applies", func(t *testing.T) {
 		cfg := testConfig(t)
 		seedRepairableLegacyObservationMutation(t, cfg, "proj-a")
 
@@ -1187,8 +1187,8 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 			"mode: apply",
 			"dry_run: false",
 			"local_only: true",
-			"applied: false",
-			"planned_action: report_legacy_mutation_payloads_deferred",
+			"applied: true",
+			"planned_action: repair_legacy_mutation_payloads",
 			"findings_total: 1",
 		} {
 			if !strings.Contains(stdout, want) {

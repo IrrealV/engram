@@ -2087,7 +2087,7 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy mutation required fields are reported without applying payload repair", func(t *testing.T) {
+	t.Run("legacy observation payload repair dry-run plans and apply updates payload only", func(t *testing.T) {
 		s := newTestStore(t)
 		if err := s.CreateSession("legacy-s1", "legacy-proj", "/tmp/legacy"); err != nil {
 			t.Fatalf("create session: %v", err)
@@ -2105,18 +2105,12 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 		}
 
 		payload := `{"sync_id":"` + syncID + `","session_id":"legacy-s1","type":"decision","content":"legacy payload missing title","scope":"project"}`
-		if _, err := s.execHook(s.db,
-			`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			DefaultSyncTargetKey,
-			SyncEntityObservation,
-			syncID,
-			SyncOpUpsert,
-			payload,
-			SyncSourceLocal,
-			"legacy-proj",
-		); err != nil {
-			t.Fatalf("insert malformed legacy mutation: %v", err)
+		legacySeq := insertLegacyMutation(t, s, legacyMutationFixture{entity: SyncEntityObservation, entityKey: syncID, payload: payload, project: "legacy-proj"})
+		beforeState, err := s.GetSyncState(DefaultSyncTargetKey)
+		if err != nil {
+			t.Fatalf("get sync state before repair: %v", err)
 		}
+		beforeMutations := countSyncMutationRows(t, s, `target_key = ?`, DefaultSyncTargetKey)
 
 		diagnosis, err := s.DiagnoseCloudUpgradeLegacyMutations("legacy-proj")
 		if err != nil {
@@ -2132,38 +2126,102 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 			t.Fatalf("expected structured legacy finding, got %+v", diagnosis.Findings[0])
 		}
 
-		report, err := s.RepairCloudUpgrade("legacy-proj", true)
+		dryRun, err := s.RepairCloudUpgrade("legacy-proj", false)
 		if err != nil {
-			t.Fatalf("repair legacy payload gaps report: %v", err)
+			t.Fatalf("dry-run legacy payload repair: %v", err)
 		}
-		if report.Class != UpgradeRepairClassRepairable || report.Applied {
-			t.Fatalf("expected unapplied repairable result while legacy apply is deferred, got %+v", report)
+		if dryRun.Class != UpgradeRepairClassRepairable || dryRun.Applied {
+			t.Fatalf("expected unapplied repairable dry-run, got %+v", dryRun)
 		}
-		if report.PlannedAction != "report_legacy_mutation_payloads_deferred" || !strings.Contains(report.Message, "legacy mutation payload apply is deferred") {
-			t.Fatalf("expected report-only legacy repair guidance, got %+v", report)
+		if dryRun.PlannedAction != "repair_legacy_mutation_payloads" || !strings.Contains(dryRun.Message, "repairable legacy mutation payload") {
+			t.Fatalf("expected planned legacy payload repair guidance, got %+v", dryRun)
 		}
-		if len(report.Findings) != 1 || report.Findings[0].EntityKey != syncID {
-			t.Fatalf("expected structured repair report findings, got %+v", report.Findings)
+		if len(dryRun.Findings) != 1 || dryRun.Findings[0].EntityKey != syncID {
+			t.Fatalf("expected structured dry-run findings, got %+v", dryRun.Findings)
 		}
 
-		var afterPayload string
+		var dryRunPayload string
 		if err := s.db.QueryRow(`
 			SELECT payload FROM sync_mutations
-			WHERE target_key = ? AND project = ? AND entity = ? AND entity_key = ? AND op = ?
-			ORDER BY seq DESC LIMIT 1
-		`, DefaultSyncTargetKey, "legacy-proj", SyncEntityObservation, syncID, SyncOpUpsert).Scan(&afterPayload); err != nil {
-			t.Fatalf("load payload after deferred repair: %v", err)
+			WHERE seq = ?
+		`, legacySeq).Scan(&dryRunPayload); err != nil {
+			t.Fatalf("load payload after dry-run: %v", err)
 		}
-		if afterPayload != payload {
-			t.Fatalf("legacy payload mutated despite deferred apply: before=%s after=%s", payload, afterPayload)
+		if dryRunPayload != payload {
+			t.Fatalf("dry-run mutated legacy payload: before=%s after=%s", payload, dryRunPayload)
+		}
+
+		report, err := s.RepairCloudUpgrade("legacy-proj", true)
+		if err != nil {
+			t.Fatalf("apply legacy payload repair: %v", err)
+		}
+		if report.Class != UpgradeRepairClassRepairable || !report.Applied || report.PlannedAction != "repair_legacy_mutation_payloads" {
+			t.Fatalf("expected applied repairable legacy payload result, got %+v", report)
+		}
+		var appliedPayload string
+		if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE seq = ?`, legacySeq).Scan(&appliedPayload); err != nil {
+			t.Fatalf("load payload after apply: %v", err)
+		}
+		var repaired syncObservationPayload
+		if err := json.Unmarshal([]byte(appliedPayload), &repaired); err != nil {
+			t.Fatalf("decode repaired payload: %v", err)
+		}
+		if repaired.Title != "Authoritative title" || repaired.Content != "legacy payload missing title" || repaired.SessionID != "legacy-s1" || repaired.Scope != "project" {
+			t.Fatalf("unexpected repaired payload: %+v", repaired)
+		}
+		afterState, err := s.GetSyncState(DefaultSyncTargetKey)
+		if err != nil {
+			t.Fatalf("get sync state after repair: %v", err)
+		}
+		if afterState.LastAckedSeq != beforeState.LastAckedSeq {
+			t.Fatalf("repair must not edit last_acked_seq: before=%d after=%d", beforeState.LastAckedSeq, afterState.LastAckedSeq)
+		}
+		afterMutations := countSyncMutationRows(t, s, `target_key = ?`, DefaultSyncTargetKey)
+		if afterMutations != beforeMutations {
+			t.Fatalf("repair must not create or delete mutations: before=%d after=%d", beforeMutations, afterMutations)
 		}
 
 		after, err := s.DiagnoseCloudUpgradeLegacyMutations("legacy-proj")
 		if err != nil {
 			t.Fatalf("diagnose after repair: %v", err)
 		}
-		if after.RepairableCount != 1 || after.BlockedCount != 0 || len(after.Findings) != 1 {
-			t.Fatalf("expected repairable diagnosis to remain after deferred repair, got %+v", after)
+		if after.RepairableCount != 0 || after.BlockedCount != 0 || len(after.Findings) != 0 {
+			t.Fatalf("expected legacy payload diagnosis to clear after apply, got %+v", after)
+		}
+	})
+
+	t.Run("legacy session payload repair applies deterministic fields from local session", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("legacy-session-payload", "legacy-session-proj", "/work/legacy-session"); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := s.EnrollProject("legacy-session-proj"); err != nil {
+			t.Fatalf("enroll project: %v", err)
+		}
+		legacySeq := insertLegacyMutation(t, s, legacyMutationFixture{
+			entity:    SyncEntitySession,
+			entityKey: "legacy-session-payload",
+			payload:   `{"id":"legacy-session-payload"}`,
+			project:   "legacy-session-proj",
+		})
+
+		report, err := s.RepairCloudUpgrade("legacy-session-proj", true)
+		if err != nil {
+			t.Fatalf("apply session payload repair: %v", err)
+		}
+		if report.Class != UpgradeRepairClassRepairable || !report.Applied || report.PlannedAction != "repair_legacy_mutation_payloads" {
+			t.Fatalf("expected applied legacy session payload repair, got %+v", report)
+		}
+		var appliedPayload string
+		if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE seq = ?`, legacySeq).Scan(&appliedPayload); err != nil {
+			t.Fatalf("load repaired session payload: %v", err)
+		}
+		var repaired syncSessionPayload
+		if err := json.Unmarshal([]byte(appliedPayload), &repaired); err != nil {
+			t.Fatalf("decode repaired session payload: %v", err)
+		}
+		if repaired.ID != "legacy-session-payload" || repaired.Project != "legacy-session-proj" || repaired.Directory != "/work/legacy-session" {
+			t.Fatalf("unexpected repaired session payload: %+v", repaired)
 		}
 	})
 
